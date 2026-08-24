@@ -1,0 +1,40 @@
+# ---- data: large, redistributable only from the vendor ----
+data/raw/**
+data/*.parquet
+!data/README.md
+
+# ---- generated output: reproducible via `make all` ----
+output/**
+!output/.gitkeep
+!output/figures/.gitkeep
+!output/tables/.gitkeep
+!output/data/.gitkeep
+
+# ---- latex build artefacts ----
+report/**/*.aux
+report/**/*.log
+report/**/*.out
+report/**/*.bbl
+report/**/*.blg
+report/**/*.fls
+report/**/*.fdb_latexmk
+report/**/*.synctex.gz
+report/**/*.toc
+report/main.pdf
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# ---- editor / os ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
