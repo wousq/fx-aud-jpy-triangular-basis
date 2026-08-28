@@ -119,6 +119,8 @@ Outputs
 
 from __future__ import annotations
 
+import time
+
 from typing import NamedTuple, Optional
 
 import re
@@ -210,6 +212,24 @@ CHUNK = 200_000
 # lag-window guard is reported as missing rather than estimated.
 MIN_WINDOW_ROWS = 5_000
 
+# convention. Smallest cell that may carry its own centring constant, in
+# seconds of open market. A half-hour cell would have its mean estimated
+# from almost nothing and would absorb the very deviations being measured.
+MIN_CELL_SECONDS = 1_800
+
+# convention. Sampling intervals for the frequency block, in seconds. The
+# question that block answers is whether a half-life quoted in seconds is a
+# duration in the market or an artefact of forward-filling a one-second grid
+# whose quotes arrive more slowly than that. 02 measured a noise share of
+# 0.70 to 0.85, so the question is not rhetorical.
+SAMPLE_STEPS = (5, 15, 60)
+
+# convention. How far past an episode's last exceeding second to keep
+# looking for the half-decay. Ten times the slowest half-life 02 reported,
+# which is long enough that a censored episode means something rather than
+# meaning the window was short.
+EPISODE_TAIL_SECONDS = 1_800
+
 CRIT = 1.959963984540054   # 95% normal quantile, for HAC intervals
 
 
@@ -221,8 +241,8 @@ class Fit(NamedTuple):
     terms: tuple
     coef: np.ndarray             # (K, 3), columns in LEGS order
     sigma: np.ndarray            # (3, 3) residual covariance
-    r2: np.ndarray               # (3,)
-    zbar: float
+    z_mean: float                # mean basis over the fitted rows, pips
+    z_drift: float               # sd across cells of the cell mean, pips
     cond: float
     alpha: np.ndarray            # (3,) adjustment coefficients
     alpha_cov: Optional[np.ndarray]   # (3, 3) HAC, None in light mode
@@ -232,9 +252,11 @@ class Fit(NamedTuple):
     half_life_step: float        # from lambda alone
     decay: np.ndarray            # (DECAY_HORIZON + 1,)
     max_eig: float
+    step: int                    # sampling interval of the fit, seconds
     resid: Optional[np.ndarray]  # (n, 3), None in light mode
     rows: Optional[np.ndarray]
     run: Optional[np.ndarray]
+    zc: Optional[np.ndarray]     # centred z(-1) on the fitted rows
 
 
 # ---------------------------------------------------------------- reporting
@@ -372,28 +394,44 @@ def identify_stress(d, labels, n_regimes):
 
 # ------------------------------------------------------------- row admission
 
-def usable_rows(index, p, ok, group):
+def adjacent_at(index, step_seconds):
+    """
+    True where the previous row is exactly `step_seconds` earlier.
+
+    The general form of utils.adjacent, which the frequency block needs
+    because a five-second sample has no one-second neighbours and every
+    guard keyed to the grid step would otherwise switch itself off. At the
+    grid step the two agree, and main asserts that rather than trusting it:
+    the comparison is on timedeltas, never on integer nanoseconds, for the
+    reason recorded in utils.
+    """
+    t = pd.DatetimeIndex(index).to_numpy()
+    out = np.zeros(len(t), dtype=bool)
+    if len(t) > 1:
+        out[1:] = np.diff(t) == np.timedelta64(step_seconds, "s")
+    return out
+
+
+def usable_rows(index, p, ok, group, step_seconds=GRID_SECONDS):
     """
     Positional indices whose whole lag window is safe to difference.
 
     Row t of the design needs prices at t-p-1 ... t: dx_t uses x_t and
     x_{t-1}, the lag block uses dx_{t-i} for i = 1..p, and z_{t-1} uses
-    x_{t-1}. So p+2 consecutive rows must all be one grid second apart, all
-    admissible under `ok`, and all carry the same value of `group`.
+    x_{t-1}. So p+2 consecutive rows must all be one sampling interval
+    apart, all admissible under `ok`, and all carry the same value of
+    `group`.
 
     Both guards are load-bearing rather than defensive. Without the
     adjacency test a 48-hour weekend becomes a single 'increment' of two
     days, which is the same bug that once merged two dislocations either
     side of a closure into one 48-hour episode. Without the group test a
     regression labelled 'pre' would be fitted partly on stressed seconds
-    wherever a lag window straddles the changepoint.
-
-    Timestamps are compared through utils.adjacent, never as integer
-    nanoseconds: an index arriving from parquet is datetime64[us], and an
-    int64 comparison against a nanosecond constant is False everywhere,
-    which turns every guard in this function off without raising anything.
+    wherever a lag window straddles the changepoint, and - since `group`
+    also carries the day - a lag window would straddle midnight and so
+    straddle two centring cells.
     """
-    adj = adjacent(index)
+    adj = adjacent_at(index, step_seconds)
     ok = np.asarray(ok, dtype=bool)
     group = np.asarray(group)
 
@@ -412,6 +450,20 @@ def usable_rows(index, p, ok, group):
     return rows, reset[rows].astype(np.int64)
 
 
+def drop_small_cells(rows, run, cell, min_rows):
+    """
+    Remove centring cells too small to carry their own constant.
+
+    A cell with a few hundred seconds in it would have its mean estimated
+    from almost nothing, and subtracting that mean would remove the very
+    deviation the error-correction term is supposed to see. In practice
+    this takes the stub day at each end of a regime and nothing else.
+    """
+    code = pd.factorize(cell[rows])[0]
+    keep = np.bincount(code)[code] >= min_rows
+    return rows[keep], run[keep], int((~keep).sum())
+
+
 # -------------------------------------------------------------- estimation
 
 def term_names(p):
@@ -423,21 +475,55 @@ def term_names(p):
     return tuple(terms)
 
 
-def _design(rows, DX, Z, p, zbar):
+def centring(rows, Z, DX, cell):
+    """
+    Cell means of the error-correction term and of the increments.
+
+    This is the fix for the thing that broke the first run. Centring z on
+    one constant per regime asks the model to explain deviations from a
+    ten-day average, and if the average basis itself wanders across those
+    ten days - it did, by a third of a pip - that wander is a slow,
+    near-unit component the fit reports as extreme persistence. The number
+    that comes back is then the half-life of the drift in the mean, not the
+    half-life of a dislocation, and the two differ by a factor of twenty.
+
+    Centring on the day instead makes the estimand the one the arbitrage
+    question asks: how long does a departure from *today's* level take to
+    close. It is the within transformation of a panel whose unit is the
+    day, applied through Frisch-Waugh rather than by carrying sixty dummy
+    columns. `usable_rows` is given the cell in its group key, so no lag
+    window straddles a cell boundary and the transformation is exact.
+
+    The increments are centred too, for completeness. Their cell means are
+    of order 1e-5 pips per second - a day's drift in a log price divided by
+    a day - and main prints the largest one so that claim is checked rather
+    than asserted.
+    """
+    code = pd.factorize(cell[rows])[0]
+    count = np.bincount(code).astype(float)
+    z_cell = np.bincount(code, weights=Z[rows - 1]) / count
+    y_cell = np.column_stack([np.bincount(code, weights=DX[rows, j]) / count
+                              for j in range(3)])
+    return code, z_cell, y_cell
+
+
+def _design(rows, DX, p, zc, y_off):
     """
     (X, Y) for a block of rows. Never called on the whole sample at once.
 
     `rows` is guaranteed by `usable_rows` to satisfy rows >= p + 1, so every
     backward index below is in range without a bounds check that would only
-    ever hide a violated precondition.
+    ever hide a violated precondition. `zc` and `y_off` are the centred
+    error-correction term and the cell means of the increments, already
+    aligned to `rows` by the caller.
     """
     m = rows.size
     X = np.empty((m, 2 + 3 * p), dtype=float)
     X[:, 0] = 1.0
-    X[:, 1] = Z[rows - 1] - zbar
+    X[:, 1] = zc
     for i in range(1, p + 1):
         X[:, 2 + 3 * (i - 1):2 + 3 * i] = DX[rows - i]
-    return X, DX[rows]
+    return X, DX[rows] - y_off
 
 
 def _chunks(n, size=CHUNK):
@@ -490,11 +576,13 @@ def decay_path(M, horizon=DECAY_HORIZON):
     return out
 
 
-def half_life(path):
+def half_life(path, step=GRID_SECONDS):
     """
-    First crossing of one half, interpolated between the two seconds that
-    bracket it. NaN when the path never gets there inside the horizon, which
-    is reported as an em dash rather than extrapolated.
+    First crossing of one half, interpolated between the two steps that
+    bracket it and converted to seconds. NaN when the path never gets there
+    inside the horizon, which is reported as an em dash rather than
+    extrapolated. `step` is what lets the frequency block report every
+    sampling interval on one axis.
     """
     below = np.flatnonzero(path <= 0.5)
     if below.size == 0:
@@ -504,8 +592,8 @@ def half_life(path):
         return 0.0
     a, b = path[h - 1], path[h]
     if not np.isfinite(a) or not np.isfinite(b) or a == b:
-        return float(h)
-    return float((h - 1) + (a - 0.5) / (a - b)) * GRID_SECONDS
+        return float(h) * step
+    return float((h - 1) + (a - 0.5) / (a - b)) * step
 
 
 def alpha_hac_cov(h, U, run, m, n, K):
@@ -541,34 +629,41 @@ def alpha_hac_cov(h, U, run, m, n, K):
     return S * (n / max(n - K, 1))
 
 
-def fit_vecm(name, rows, run, DX, Z, p, light=False, nw=NW_LAGS):
+def fit_vecm(name, rows, run, DX, Z, p, cell, light=False, nw=NW_LAGS,
+             step=GRID_SECONDS):
     """
-    One regime, one lag order.
+    One regime, one lag order, one sampling interval.
 
     Cross-products are accumulated in chunks, which keeps peak memory at the
     chunk rather than at the sample and costs nothing: X'X, X'Y and Y'Y are
     all the normal equations need, and the residual covariance follows from
     them as Y'Y - B'X'Y without a second pass. `light` stops there and is
-    what the sensitivity table and the daily series use; the full path also
-    materialises the residuals, which are needed for the HAC term, the
-    residual autocorrelations and 06.
+    what the sensitivity table, the frequency block and the daily series
+    use; the full path also materialises the residuals, which are needed for
+    the HAC term, the residual autocorrelations and 06.
+
+    `cell` decides what the error-correction term is measured against. Pass
+    the day for the estimand this project wants, or the regime to reproduce
+    the pooled fit and see what the difference is worth.
     """
     n, K = rows.size, 2 + 3 * p
     if n <= 4 * K:
         raise ValueError(f"{name}: {n:,} rows is too few for {K} regressors")
 
-    zbar = float(Z[rows - 1].mean())
+    code, z_cell, y_cell = centring(rows, Z, DX, cell)
+    zc = Z[rows - 1] - z_cell[code]
+    y_off = y_cell[code]
+    z_mean = float(z_cell.mean())
+    z_drift = float(z_cell.std(ddof=1)) if z_cell.size > 1 else 0.0
 
     XtX = np.zeros((K, K))
     XtY = np.zeros((K, 3))
     YtY = np.zeros((3, 3))
-    sumY = np.zeros(3)
     for a, b in _chunks(n):
-        X, Y = _design(rows[a:b], DX, Z, p, zbar)
+        X, Y = _design(rows[a:b], DX, p, zc[a:b], y_off[a:b])
         XtX += X.T @ X
         XtY += X.T @ Y
         YtY += Y.T @ Y
-        sumY += Y.sum(axis=0)
 
     cond = float(np.linalg.cond(XtX))
     try:
@@ -583,9 +678,6 @@ def fit_vecm(name, rows, run, DX, Z, p, light=False, nw=NW_LAGS):
     uu = YtY - coef.T @ XtY
     uu = 0.5 * (uu + uu.T)                     # kill asymmetry from rounding
     sigma = uu / max(n - K, 1)
-    sst = np.diag(YtY) - sumY ** 2 / n
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r2 = np.where(sst > 0, 1.0 - np.diag(uu) / sst, np.nan)
 
     alpha = coef[1, :].copy()
     lam = float(W @ alpha)
@@ -593,31 +685,31 @@ def fit_vecm(name, rows, run, DX, Z, p, light=False, nw=NW_LAGS):
     gammas = [coef[2 + 3 * (i - 1):2 + 3 * i, :].T for i in range(1, p + 1)]
     M = companion(alpha, gammas)
     path = decay_path(M)
-    hl = half_life(path)
-    hl_step = (float(np.log(0.5) / np.log1p(lam)) * GRID_SECONDS
+    hl = half_life(path, step)
+    hl_step = (float(np.log(0.5) / np.log1p(lam)) * step
                if -2.0 < lam < 0.0 else float("nan"))
     max_eig = float(np.abs(np.linalg.eigvals(M)).max())
 
     if light:
-        return Fit(name, n, p, term_names(p), coef, sigma, r2, zbar, cond,
-                   alpha, None, lam, float("nan"), hl, hl_step, path,
-                   max_eig, None, None, None)
+        return Fit(name, n, p, term_names(p), coef, sigma, z_mean, z_drift,
+                   cond, alpha, None, lam, float("nan"), hl, hl_step, path,
+                   max_eig, step, None, None, None, None)
 
     # Residuals, and the single scalar series each equation's HAC term needs.
     q = np.linalg.solve(XtX, np.eye(K)[1])
     U = np.empty((n, 3))
     hq = np.empty(n)
     for a, b in _chunks(n):
-        X, Y = _design(rows[a:b], DX, Z, p, zbar)
+        X, Y = _design(rows[a:b], DX, p, zc[a:b], y_off[a:b])
         U[a:b] = Y - X @ coef
         hq[a:b] = X @ q
 
     cov = alpha_hac_cov(hq, U, run, nw + 1, n, K)
     lam_se = float(np.sqrt(max(W @ cov @ W, 0.0)))
 
-    return Fit(name, n, p, term_names(p), coef, sigma, r2, zbar, cond,
-               alpha, cov, lam, lam_se, hl, hl_step, path, max_eig,
-               U, rows, run)
+    return Fit(name, n, p, term_names(p), coef, sigma, z_mean, z_drift, cond,
+               alpha, cov, lam, lam_se, hl, hl_step, path, max_eig, step,
+               U, rows, run, zc)
 
 
 def resid_acf(u, run, lags):
@@ -685,9 +777,70 @@ def modal_onset(index):
         return None
 
 
+# -------------------------------------------------------- model-free check
+
+def episode_decay(d, labels, n_regimes, tail=EPISODE_TAIL_SECONDS):
+    """
+    How long a dislocation actually took to halve, measured with a ruler.
+
+    No lag order, no centring, no model: for each episode 01 detected, find
+    the second at which the basis was widest and count forward to the first
+    second at which it had fallen to half that. This is the only estimate of
+    persistence in the project that cannot be argued with on specification
+    grounds, which is exactly why it belongs next to the ones that can.
+
+    Two honest limitations. Episodes are a selected sample - they are the
+    stretches that exceeded 01's threshold, so this measures the decay of
+    large dislocations rather than of typical ones. And the count is
+    censored where the basis has not halved within `tail`; those are
+    reported as censored rather than dropped, because dropping them would
+    discard exactly the slow episodes the question is about.
+    """
+    path = DAT_DIR / "01_episodes.parquet"
+    if not path.exists():
+        return None
+    ep = pd.read_parquet(path)
+    if not len(ep):
+        return None
+
+    b = d["basis"].to_numpy()
+    adj = adjacent(d.index)
+    n = len(b)
+    starts = pd.DatetimeIndex(d.index).get_indexer(pd.DatetimeIndex(ep["start"]))
+    ends = pd.DatetimeIndex(d.index).get_indexer(pd.DatetimeIndex(ep["end"]))
+
+    rows = []
+    for a, e in zip(starts, ends):
+        if a < 0 or e < a:
+            continue
+        seg = np.abs(b[a:e + 1])
+        k = a + int(np.argmax(seg))
+        peak = float(seg.max())
+        if not np.isfinite(peak) or peak <= 0:
+            continue
+        stop = min(n, k + tail + 1)
+        # Truncate at the first break in the clock: a dislocation cannot be
+        # observed decaying across a closure, and pretending otherwise is
+        # the same mistake as differencing across one.
+        gaps = np.flatnonzero(~adj[k + 1:stop])
+        if gaps.size:
+            stop = k + 1 + int(gaps[0])
+        window = np.abs(b[k:stop])
+        hit = np.flatnonzero(window <= 0.5 * peak)
+        rows.append({
+            "regime": int(labels[k]),
+            "peak_abs": peak,
+            "seconds_to_half": float(hit[0]) if hit.size else np.nan,
+            "censored": not bool(hit.size),
+        })
+
+    out = pd.DataFrame(rows)
+    return out if len(out) else None
+
+
 # ------------------------------------------------------------------- tables
 
-def headline_table(fits, names, cross):
+def headline_table(fits, names):
     """
     The result, one column per regime.
 
@@ -718,9 +871,9 @@ def headline_table(fits, names, cross):
             lab = PAIR_LABEL[LEG_SOURCE[leg]]
             share = (W[j] * f.alpha[j] / f.lam) if f.lam != 0 else np.nan
             col[f"share of closure, {lab}"] = num(share, ".2f")
+        col["mean basis over the segment (pips)"] = num(f.z_mean, ".4f")
         col["half-life, one-step (s)"] = num(f.half_life_step, ".2f")
         col["half-life, full system (s)"] = num(f.half_life, ".2f")
-        col["02 AR(1) half-life (s)"] = num(cross.get(f.name, np.nan), ".2f")
         col["largest eigenvalue"] = num(f.max_eig, ".4f")
         cols[name] = col
     return pd.DataFrame(cols).fillna("—")
@@ -740,18 +893,74 @@ def fit_table(fits, names, acf, boundaries):
                "seconds fitted": f"{f.n:,}",
                "lag order p": f"{f.p}", "regressors": f"{2 + 3 * f.p}",
                "condition number of X'X": num(f.cond, ".3e"),
-               "mean of z on the fitted rows (pips)": num(f.zbar, ".4f")}
+               # Not diagnostics. The mean is a displacement of the basis
+               # away from parity that lasted the whole segment, and the
+               # spread of the daily means is the drift that made the
+               # regime-centred fit report a near-unit root.
+               "mean basis over the segment (pips)": num(f.z_mean, ".4f"),
+               "sd of the daily mean basis (pips)": num(f.z_drift, ".4f")}
         for j, leg in enumerate(LEGS):
             lab = PAIR_LABEL[LEG_SOURCE[leg]]
-            col[f"R2, {lab} equation"] = num(f.r2[j], ".4f")
             col[f"residual sd, {lab} (pips)"] = num(sd[j], ".4f")
-        pairs = [(0, 1), (0, 2), (1, 2)]
-        for a, b in pairs:
+        for a, b in [(0, 1), (0, 2), (1, 2)]:
             la = PAIR_LABEL[LEG_SOURCE[LEGS[a]]]
             lb = PAIR_LABEL[LEG_SOURCE[LEGS[b]]]
             col[f"residual corr, {la} vs {lb}"] = num(corr[a, b], ".3f")
         col["residual rho_1, basis innovation"] = num(acf[name][0], ".3f")
         col["residual rho_60, basis innovation"] = num(acf[name][-1], ".3f")
+        cols[name] = col
+    return pd.DataFrame(cols).fillna("—")
+
+
+def persistence_table(fits, names, daily, decay, cross):
+    """
+    The same quantity by three routes that share no machinery.
+
+    The pooled fit, one fit per day, and a ruler laid against the episodes
+    01 found. If they agree the number is real. If they do not, the
+    disagreement is the finding, and it is better placed in a table the
+    report inputs than in a footnote nobody reads.
+    """
+    def spread(v, spec=".1f"):
+        v = np.asarray(pd.to_numeric(v, errors="coerce"), dtype=float)
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            return "—", "—"
+        return (num(np.median(v), spec),
+                f"[{np.percentile(v, 25):.1f}, {np.percentile(v, 75):.1f}]")
+
+    cols = {}
+    for k, name in enumerate(names):
+        f = fits.get(name)
+        col = {"pooled fit, half-life (s)":
+               num(f.half_life, ".1f") if f else "—",
+               "pooled fit, largest eigenvalue":
+               num(f.max_eig, ".4f") if f else "—"}
+
+        mine = daily[daily["regime"] == name] if daily is not None else None
+        if mine is not None and len(mine):
+            med, iqr = spread(mine["half_life_s"])
+            col["day by day, days fitted"] = f"{int(mine['half_life_s'].notna().sum())}"
+            col["day by day, median half-life (s)"] = med
+            col["day by day, interquartile range"] = iqr
+        else:
+            col.update({"day by day, days fitted": "—",
+                        "day by day, median half-life (s)": "—",
+                        "day by day, interquartile range": "—"})
+
+        mine = decay[decay["regime"] == k] if decay is not None else None
+        if mine is not None and len(mine):
+            med, iqr = spread(mine["seconds_to_half"])
+            col["episodes, count"] = f"{len(mine)}"
+            col["episodes, censored"] = f"{int(mine['censored'].sum())}"
+            col["episodes, median seconds to half peak"] = med
+            col["episodes, interquartile range"] = iqr
+        else:
+            col.update({"episodes, count": "—", "episodes, censored": "—",
+                        "episodes, median seconds to half peak": "—",
+                        "episodes, interquartile range": "—"})
+
+        col["02 AR(1) half-life (s)"] = num(cross.get(name, np.nan), ".2f")
         cols[name] = col
     return pd.DataFrame(cols).fillna("—")
 
@@ -996,7 +1205,7 @@ def audit(fits, names, prefix="03_"):
 def main():
     make_dirs()
     set_style()
-
+    start_time = time.perf_counter()
     # ------------------------------------------------------------- load
     print("load")
     path = DAT_DIR / "01_clean.parquet"
@@ -1025,6 +1234,16 @@ def main():
     print(f" scaled log basis is {ratio:.4f} x the pip basis of 01; "
           f"alpha is a ratio of two quantities on this scale, so the scale "
           f"cancels")
+
+    # The frequency block needs adjacency at intervals other than the grid
+    # step, so it carries its own implementation. Checked against the shared
+    # one here rather than trusted: two implementations of the guard that
+    # stops this pipeline differencing across a weekend is one more than the
+    # project's conventions allow, and this is the price of keeping it.
+    if not np.array_equal(adjacent(d.index),
+                          adjacent_at(d.index, GRID_SECONDS)):
+        raise AssertionError("adjacent_at disagrees with utils.adjacent at "
+                             "the grid step")
 
     # ---------------------------------------------------------- regimes
     print("regimes")
@@ -1077,6 +1296,13 @@ def main():
     roll = in_rollover(d.index).to_numpy()
     print(f" excluding {roll.mean():.2%} of seconds as rollover")
 
+    # The centring cell: one per regime per day. This is the estimand
+    # decision, not a technicality, so it is made once here and everything
+    # downstream inherits it.
+    day = pd.DatetimeIndex(d.index).floor("D")
+    day_code = pd.factorize(day)[0]
+    cell = labels.astype(np.int64) * (day_code.max() + 1) + day_code
+
     # ------------------------------------------------------------ rows
     #
     # One row set, built once at the deepest lag order the script will ever
@@ -1085,13 +1311,22 @@ def main():
     # samples, which is not a comparison.
     print("rows")
     ok = (~roll) & (pmax >= P_MIN)
-    rows_all, run_all = usable_rows(d.index, LAG_CAP, ok, labels)
+    rows_all, run_all = usable_rows(d.index, LAG_CAP, ok, cell)
+    rows_all, run_all, tiny = drop_small_cells(rows_all, run_all, cell,
+                                               MIN_CELL_SECONDS)
     print(f" {rows_all.size:,} of {len(d):,} seconds admitted at p = "
           f"{LAG_CAP} (contiguous lag window, outside rollover, one regime, "
-          f"posterior at least {P_MIN:.0%})")
+          f"one day, posterior at least {P_MIN:.0%})")
     dropped_prob = int(((~roll) & (pmax < P_MIN)).sum())
     print(f" {dropped_prob:,} seconds set aside as too close to a "
-          f"changepoint to label confidently")
+          f"changepoint to label confidently; {tiny:,} more in day cells "
+          f"shorter than {MIN_CELL_SECONDS:,} seconds")
+
+    # The claim that centring the increments is immaterial, checked.
+    _, _, y_cell_all = centring(rows_all, Z, DX, cell)
+    print(f" largest cell mean of an increment: "
+          f"{np.abs(y_cell_all).max():.2e} pips/s — the centring that "
+          f"matters is the one on the basis, not on the returns")
 
     by_regime = {}
     for k, name in enumerate(names):
@@ -1113,7 +1348,7 @@ def main():
         for name in names:
             r, run = by_regime[name]
             try:
-                f = fit_vecm(name, r, run, DX, Z, p, light=True)
+                f = fit_vecm(name, r, run, DX, Z, p, cell, light=True)
             except (ValueError, np.linalg.LinAlgError) as exc:
                 print(f"  p={p} {name}: {exc}")
                 ok_grid = False
@@ -1162,7 +1397,7 @@ def main():
     lags = np.arange(1, NW_LAGS * 2 + 1)
     for name in names:
         r, run = by_regime[name]
-        f = fit_vecm(name, r, run, DX, Z, p_star)
+        f = fit_vecm(name, r, run, DX, Z, p_star, cell)
         fits[name] = f
         acf[name] = resid_acf(f.resid @ W, run, lags)
         print(f" {name:<8} n {f.n:>10,}  lambda {f.lam:+.4f} "
@@ -1188,9 +1423,79 @@ def main():
             print("  note: 02_regime_stats.csv present but its half-life row "
                   "could not be read; the cross-check column is left empty")
 
+    # ------------------------------------------------ daily closure speed
+    #
+    # The same model fitted one day at a time, with no regime label
+    # supplied. Two jobs. It is the continuous view the figure needs, and it
+    # is a control on the pooled fit: a day cannot see across-day drift, so
+    # where the pooled and daily numbers disagree the disagreement is the
+    # drift and not the dislocations.
+    print("day by day")
+    rows_day, run_day = usable_rows(d.index, LAG_CAP, ~roll, day_code)
+    rows_day, run_day, _ = drop_small_cells(rows_day, run_day, day_code,
+                                            MIN_WINDOW_ROWS)
+    daily_rows = []
+    for code in np.unique(day_code[rows_day]):
+        sel = rows_day[day_code[rows_day] == code]
+        stamp = day[np.flatnonzero(day_code == code)[0]]
+        mode = labels[sel]
+        record = {"day": stamp, "seconds": int(sel.size),
+                  "regime": names[int(np.bincount(mode).argmax())],
+                  "lambda": np.nan, "half_life_s": np.nan}
+        if sel.size >= MIN_WINDOW_ROWS:
+            try:
+                f = fit_vecm(str(stamp.date()), sel,
+                             run_day[day_code[rows_day] == code], DX, Z,
+                             p_star, day_code, light=True)
+                record["lambda"] = f.lam
+                record["half_life_s"] = f.half_life
+            except (ValueError, np.linalg.LinAlgError):
+                pass
+        daily_rows.append(record)
+
+    daily = pd.DataFrame(daily_rows).set_index("day")
+    print(f" {int(daily['half_life_s'].notna().sum())} of {len(daily)} days "
+          f"fitted (a day needs {MIN_WINDOW_ROWS:,} admissible seconds)")
+    for name in names:
+        v = daily.loc[daily["regime"] == name, "half_life_s"].dropna()
+        if len(v):
+            print(f"  {name:<8} median {v.median():7.1f} s over {len(v)} "
+                  f"days   [{v.quantile(.25):.1f}, {v.quantile(.75):.1f}]")
+    save_table(
+        daily.assign(**{
+            "lambda": [num(v, ".4f") for v in daily["lambda"]],
+            "half_life_s": [num(v, ".2f") for v in daily["half_life_s"]],
+        }),
+        "03_closure_speed",
+        caption=("The same model fitted one day at a time, with no regime "
+                 "label supplied. A day is long enough to observe any "
+                 "half-life this project reports, so a regime whose pooled "
+                 "half-life is far above its own daily median is being told "
+                 "about drift in the average basis rather than about "
+                 "dislocations. Days with fewer than "
+                 f"{MIN_WINDOW_ROWS:,} admissible seconds are left "
+                 "unestimated rather than fitted on a stub."),
+        label="tab:closure_speed",
+    )
+
+    # ------------------------------------------------- model-free check
+    print("episodes")
+    decay = episode_decay(d, labels, n_regimes)
+    if decay is None:
+        print(" 01_episodes.parquet absent; the model-free check is omitted")
+    else:
+        cens = int(decay["censored"].sum())
+        print(f" {len(decay)} episodes measured with a ruler, {cens} still "
+              f"above half peak after {EPISODE_TAIL_SECONDS:,} s")
+        for k, name in enumerate(names):
+            v = decay.loc[decay["regime"] == k, "seconds_to_half"].dropna()
+            if len(v):
+                print(f"  {name:<8} median {v.median():7.1f} s over "
+                      f"{len(v)} episodes")
+
     # ---------------------------------------------------------- tables
     print("tables")
-    head = headline_table(fits, names, cross)
+    head = headline_table(fits, names)
     save_table(
         head, "03_error_correction",
         caption=("Error-correction dynamics of the triangle by estimated "
@@ -1199,24 +1504,44 @@ def main():
                  "share of the current gap each leg erases per second, "
                  "lambda their combination and so the closure rate of the "
                  "basis itself; intervals are Newey-West at "
-                 f"{NW_LAGS} seconds. The per-leg intervals are much wider "
-                 "than the interval on lambda, because each leg's own "
-                 "volatility dwarfs the basis while the common moves cancel "
-                 "in the combination; the closure rate is a far sturdier "
-                 "quantity than the split of it across legs. The last two "
-                 "rows are checks, not results: the 02 column comes from a "
-                 "plain AR(1) on the level of the basis and shares no "
-                 "machinery with this fit."),
+                 f"{NW_LAGS} seconds. The error-correction term is measured "
+                 "against the day, so lambda is the speed at which a "
+                 "departure from the day's own level closes and not the "
+                 "speed at which the level itself moves. The per-leg "
+                 "intervals are much wider than the interval on lambda, "
+                 "because each leg's own volatility dwarfs the basis while "
+                 "the common moves cancel in the combination; the closure "
+                 "rate is a far sturdier quantity than the split of it "
+                 "across legs."),
         label="tab:error_correction",
     )
     print(head.to_string())
 
+    pers = persistence_table(fits, names, daily, decay, cross)
+    save_table(
+        pers, "03_persistence",
+        caption=("How long a dislocation survives, by three routes that "
+                 "share no machinery: the pooled fit, the same model fitted "
+                 "one day at a time, and a ruler laid against the episodes "
+                 "detected in section 01. The last row is the AR(1) estimate "
+                 "from section 02. Agreement between them is the reason to "
+                 "believe any of them; disagreement is a result in its own "
+                 "right and is reported here rather than resolved by "
+                 "choosing a favourite."),
+        label="tab:persistence",
+    )
+    print(pers.to_string())
+
     fitinfo = fit_table(fits, names, acf, boundaries)
     save_table(
         fitinfo, "03_var_fit",
-        caption=("Fit and residual diagnostics. Residual standard deviations "
-                 "are in the scaled log units of the text, which are AUD/JPY "
-                 "pips to within the cross's deviation from 100. The two "
+        caption=("Fit and residual diagnostics. Dispersions are in the "
+                 "scaled log units of the text, which are AUD/JPY pips to "
+                 "within the cross's deviation from 100. The two mean-basis "
+                 "rows are not diagnostics: the first is a displacement away "
+                 "from parity that persisted for a whole segment, and the "
+                 "second is the day-to-day movement in that displacement, "
+                 "which is what the daily centring removes. The "
                  "autocorrelation rows say whether the lag order was deep "
                  "enough for the Newey-West truncation to cover what is "
                  "left."),
@@ -1237,6 +1562,8 @@ def main():
 
     # ----------------------------------------------------- sensitivity
     print("sensitivity")
+    epoch_s = (pd.DatetimeIndex(d.index).to_numpy()
+               .astype("datetime64[s]").astype(np.int64))
 
     def summarise(tag, fitted, note=""):
         row = {"variant": tag}
@@ -1257,7 +1584,7 @@ def main():
         return row
 
     def run_variant(tag, p=None, min_prob=None, labels_v=None, ok_v=None,
-                    note=""):
+                    centre=None, note=""):
         """
         One row of 03_sensitivity. Exactly one thing changes per call: the
         lag order, the posterior threshold, the admissible seconds, or the
@@ -1275,7 +1602,12 @@ def main():
             base_ok = ok_v
         else:
             base_ok = ok
-        r_all, run_v = usable_rows(d.index, LAG_CAP, base_ok, lab)
+        cel = cell if centre is None else centre
+        cell_v = (lab.astype(np.int64) * (day_code.max() + 1) + day_code
+                  if labels_v is not None and centre is None else cel)
+        r_all, run_v = usable_rows(d.index, LAG_CAP, base_ok, cell_v)
+        r_all, run_v, _ = drop_small_cells(r_all, run_v, cell_v,
+                                           MIN_CELL_SECONDS)
         out = {}
         for k, name in enumerate(names):
             sel = lab[r_all] == k
@@ -1284,11 +1616,53 @@ def main():
                 continue
             try:
                 out[name] = fit_vecm(name, r_all[sel], run_v[sel], DX, Z, p,
-                                     light=True)
+                                     cell_v, light=True)
             except (ValueError, np.linalg.LinAlgError) as exc:
                 print(f"  {tag} / {name}: {exc}")
                 out[name] = None
         return summarise(tag, out, note)
+
+    def frequency_variant(step_s):
+        """
+        The same fit on a coarser sample of the same seconds.
+
+        The check that matters most for a persistence result on this data.
+        The one-second grid is forward-filled, and 02 measured a noise share
+        of 0.70 to 0.85, so much of what looks like a slowly closing basis
+        may be a stale quote. A half-life that is a duration in the market
+        is invariant to how often it is sampled; one manufactured by the
+        fill shrinks towards the sampling interval. The lag order is set to
+        span the same wall-clock memory at every frequency, so the only
+        thing changing is the sample.
+        """
+        sel = np.flatnonzero(epoch_s % step_s == 0)
+        sub = d.index[sel]
+        Xs = X[sel]
+        Zs = Xs @ W
+        adj_s = adjacent_at(sub, step_s)
+        DXs = np.full_like(Xs, np.nan)
+        DXs[1:] = Xs[1:] - Xs[:-1]
+        DXs[~adj_s] = np.nan
+        cell_s, lab_s = cell[sel], labels[sel]
+        p_s = max(1, int(round(p_star * GRID_SECONDS / step_s)))
+        r_all, run_v = usable_rows(sub, p_s, ok[sel], cell_s,
+                                   step_seconds=step_s)
+        r_all, run_v, _ = drop_small_cells(
+            r_all, run_v, cell_s, max(2, MIN_CELL_SECONDS // step_s))
+        out = {}
+        for k, name in enumerate(names):
+            pick = lab_s[r_all] == k
+            if pick.sum() <= 4 * (2 + 3 * p_s):
+                out[name] = None
+                continue
+            try:
+                out[name] = fit_vecm(name, r_all[pick], run_v[pick], DXs, Zs,
+                                     p_s, cell_s, light=True, step=step_s)
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                print(f"  {step_s}s / {name}: {exc}")
+                out[name] = None
+        return summarise(f"sampled every {step_s} s", out,
+                         f"p = {p_s}, the same {p_s * step_s} s of memory")
 
     variants = [summarise(f"baseline (p = {p_star}, "
                           f"posterior at least {P_MIN:.0%})", fits,
@@ -1308,6 +1682,16 @@ def main():
     ok_roll = pmax >= P_MIN
     variants.append(run_variant("rollover seconds included", ok_v=ok_roll,
                                 note="17:00-17:30 back in"))
+
+    # The specification this replaced, kept because the gap between this row
+    # and the baseline is the whole reason for the daily centring.
+    variants.append(run_variant(
+        "centred on the regime, not the day", centre=labels.astype(np.int64),
+        note="one constant for a whole segment; the drift in the mean is "
+             "left in and read as persistence"))
+
+    for step_s in SAMPLE_STEPS:
+        variants.append(frequency_variant(step_s))
 
     if stress_k > 0:
         onset = boundaries[names[stress_k]][0]
@@ -1341,60 +1725,41 @@ def main():
                   "02_changepoint.csv; that sensitivity row is omitted")
 
     sens = pd.DataFrame(variants).set_index("variant")
+
+    # A sensitivity table nobody reads the middle of. Say out loud which
+    # rows move the answer, so a choice that changes the headline has to be
+    # argued for in the text instead of being buried in a row.
+    base = pd.to_numeric(sens["stress / calmest"].iloc[0], errors="coerce")
+    moved = []
+    for tag, v in sens["stress / calmest"].items():
+        v = pd.to_numeric(v, errors="coerce")
+        if (np.isfinite(base) and np.isfinite(v) and base > 0
+                and max(v / base, base / max(v, 1e-9)) > 1.5):
+            moved.append((tag, v))
+    if moved:
+        print(f" variants that move the headline ratio from {base:.2f}:")
+        for tag, v in moved:
+            print(f"   {v:8.2f}  {tag}")
+    else:
+        print(" no variant moves the headline ratio by more than half again")
+
     save_table(
         sens, "03_sensitivity",
         caption=("Sensitivity of the error-correction result. The first "
                  "block varies the transitory lag order, the second the "
                  "posterior threshold that buffers the changepoints, the "
-                 "third the excluded rollover window, and the fourth where "
-                 "the pre-shock window is taken to end - including the "
-                 "24 July modal onset this project does not adopt, so its "
-                 "cost can be read rather than argued."),
+                 "third the excluded rollover window and what the "
+                 "error-correction term is measured against, the fourth the "
+                 "sampling interval, and the fifth where the pre-shock "
+                 "window is taken to end - including the 24 July modal "
+                 "onset this project does not adopt, so its cost can be "
+                 "read rather than argued. The frequency rows are the ones "
+                 "to read first: a half-life that is a duration in the "
+                 "market does not depend on how often the market is "
+                 "sampled."),
         label="tab:var_sensitivity",
     )
     print(sens.to_string())
-
-    # ------------------------------------------------ daily closure speed
-    #
-    # Fitted with no regime label supplied, so the figure it feeds is not a
-    # restatement of the partition it is drawn over.
-    print("daily closure speed")
-    day = pd.DatetimeIndex(d.index).floor("D")
-    day_key = pd.factorize(day)[0]
-    rows_day, _ = usable_rows(d.index, LAG_CAP, ~roll, day_key)
-    daily_rows = []
-    for code in np.unique(day_key[rows_day]):
-        sel = rows_day[day_key[rows_day] == code]
-        stamp = day[np.flatnonzero(day_key == code)[0]]
-        record = {"day": stamp, "seconds": int(sel.size),
-                  "lambda": np.nan, "half_life_s": np.nan}
-        if sel.size >= MIN_WINDOW_ROWS:
-            try:
-                f = fit_vecm(str(stamp.date()), sel,
-                             np.zeros(sel.size, dtype=np.int64), DX, Z,
-                             p_star, light=True)
-                record["lambda"] = f.lam
-                record["half_life_s"] = f.half_life
-            except (ValueError, np.linalg.LinAlgError):
-                pass
-        daily_rows.append(record)
-
-    daily = pd.DataFrame(daily_rows).set_index("day")
-    fitted_days = int(daily["half_life_s"].notna().sum())
-    print(f" {fitted_days} of {len(daily)} days fitted "
-          f"(a day needs {MIN_WINDOW_ROWS:,} admissible seconds)")
-    save_table(
-        daily.assign(**{
-            "lambda": [num(v, ".4f") for v in daily["lambda"]],
-            "half_life_s": [num(v, ".2f") for v in daily["half_life_s"]],
-        }),
-        "03_closure_speed",
-        caption=("The same model fitted one day at a time, with no regime "
-                 "label supplied. Days with fewer than "
-                 f"{MIN_WINDOW_ROWS:,} admissible seconds are left "
-                 "unestimated rather than fitted on a stub."),
-        label="tab:closure_speed",
-    )
 
     # --------------------------------------------------------- figures
     print("figures")
@@ -1414,7 +1779,9 @@ def main():
             index=d.index[f.rows],
             columns=[f"e_{c.removeprefix('x_')}" for c in LEGS])
         frame.insert(0, "regime", np.int8(k))
-        frame["z_lag"] = (Z[f.rows - 1] - f.zbar).astype(np.float32)
+        # The centred term the fit actually used, so 06 does not have to
+        # reconstruct the day cells to reproduce this regression.
+        frame["z_lag"] = f.zc.astype(np.float32)
         # A run is a maximal stretch of consecutive seconds inside one
         # regime. 06 needs it: without it a lagged difference taken on this
         # file would silently span a weekend, which is the one mistake this
@@ -1439,7 +1806,9 @@ def main():
 
     print("checks")
     audit(fits, names)
-
+    end_time = time.perf_counter()
+    elapsed_time = end_time - start_time
+    print(f"Execution time: {elapsed_time:.4f} seconds")
 
 if __name__ == "__main__":
     main()
