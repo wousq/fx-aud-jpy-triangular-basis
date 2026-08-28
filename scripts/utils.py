@@ -81,7 +81,26 @@ LEG_COLOUR = {"audusd_mid": LEG_AUDUSD,
 
 R1 = "#6D9AC6"      # first regime
 R2 = "#1F4E79"      # second regime
-REGIME_COLOUR = (R1, R2)
+R3 = "#AFC8DF"      # third regime, where a model estimates one
+
+# One hue at three lightnesses. Lightness tracks dislocation, not time:
+# where three segments are estimated the middle one is the wide one, so
+# ordering by position would put the darkest shade on the calm tail and
+# invert the only thing the ramp is meant to say.
+REGIME_COLOUR = (R1, R2, R3)
+
+
+def regime_colours(n):
+    """
+    Colours for n estimated regimes.
+
+    The number of regimes is an output of 02, not a constant, so anything
+    plotting them asks for as many as were estimated rather than indexing
+    a fixed tuple and failing on the day a third segment is selected.
+    """
+    if n <= len(REGIME_COLOUR):
+        return REGIME_COLOUR[:n]
+    return [REGIME_COLOUR[i % len(REGIME_COLOUR)] for i in range(n)]
 
 FOUND = "#D9922E"   # findings only
 MUTE = "#98A2AB"    # excluded from estimation
@@ -387,7 +406,7 @@ def set_style():
     plt.rcParams.update({
         "font.size": 9,
         "axes.titlesize": 9.5,
-        "axes.titleweight": "semibold",
+        "axes.titleweight": 500,
         "axes.titlelocation": "left",
         "axes.titlepad": 10,
         "axes.labelsize": 8.5,
