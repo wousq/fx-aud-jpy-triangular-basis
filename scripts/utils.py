@@ -1,3 +1,4 @@
+
 """
 utils.py - shared helpers. Definitions only; no execution at import.
 """
@@ -10,7 +11,12 @@ import matplotlib
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_PATH = ROOT / "data" / "synchronized_rates.parquet"
+# 00_ingest_and_sync.py writes here and 00b_data_quality.py reads here.
+# Section 02 of the notes shows data/synchronized_rates.parquet, one level
+# up; that document is the one that is out of date. The legacy location is
+# still accepted on load so an older working tree does not break.
+DATA_PATH = ROOT / "data" / "processed" / "synchronized_rates.parquet"
+LEGACY_DATA_PATH = ROOT / "data" / "synchronized_rates.parquet"
 FIG_DIR = ROOT / "output" / "figures"
 TAB_DIR = ROOT / "output" / "tables"
 TEX_DIR = ROOT / "report" / "tables"
@@ -23,8 +29,18 @@ PAIR_LABEL = {"audusd_mid": "AUD/USD", "usdjpy_mid": "USD/JPY",
 
 # Grid resolution. Used to detect clock jumps, so it is named rather than
 # written as a literal at the point of use.
+#
+# Expressed as a timedelta64 rather than as integer nanoseconds. A
+# DatetimeIndex carries its own resolution: pandas 3 defaults to
+# microseconds, and DuckDB writes parquet TIMESTAMP in microseconds, so an
+# index arriving from data/processed is datetime64[us]. Comparing
+# index.asi8 against a nanosecond literal is then False everywhere and
+# every gap guard silently stops guarding — no exception, just increments
+# discarded and runs that span closures. numpy promotes timedelta64
+# operands to the finer unit, so the comparison below is correct at any
+# resolution.
 GRID_SECONDS = 1
-GRID_NS = GRID_SECONDS * 1_000_000_000
+GRID_STEP = np.timedelta64(GRID_SECONDS, "s")
 
 # Timestamps are New York local time. The vendor documents EST, but the
 # sample spans 2024-07 to 2024-08, entirely inside US daylight saving
@@ -127,6 +143,10 @@ def load_data(path=DATA_PATH, columns=None):
     """
     if columns is not None:
         columns = list(dict.fromkeys(["grid_time", *columns]))
+    path = Path(path)
+    if not path.exists() and path == DATA_PATH and LEGACY_DATA_PATH.exists():
+        print(f"    note: reading {LEGACY_DATA_PATH}, not {DATA_PATH}")
+        path = LEGACY_DATA_PATH
     df = pd.read_parquet(path, columns=columns)
     df = df.rename(columns={"grid_time": "t"})
     if "t" not in df.columns:
@@ -167,6 +187,66 @@ def _runs(flag):
     a = np.asarray(flag, dtype=bool).view(np.int8)
     edges = np.flatnonzero(np.diff(np.concatenate(([0], a, [0]))))
     return edges[::2], edges[1::2]
+
+
+def adjacent(index):
+    """
+    True where the previous row is exactly one grid step earlier.
+
+    Every increment, staleness and run-splitting calculation in the project
+    depends on this test, so it exists once. The first row has no
+    predecessor and is False, which is the same convention `unchanged` and
+    `closed_mask` use: an unknown predecessor is not evidence.
+    """
+    t = pd.DatetimeIndex(index).to_numpy()
+    out = np.zeros(len(t), dtype=bool)
+    if len(t) > 1:
+        out[1:] = np.diff(t) == GRID_STEP
+    return out
+
+
+def check_grid(index, name="index", min_adjacent=0.5):
+    """
+    Assert that `index` is the grid the analysis assumes, and say what is
+    wrong when it is not.
+
+    Called at the top of anything that computes increments. The failure
+    this catches is not hypothetical: a resolution mismatch makes every
+    adjacency test False, which turns into empty features and a
+    downstream error naming a symptom rather than a cause. Returns the
+    diagnostics so a caller can print or table them.
+    """
+    t = pd.DatetimeIndex(index)
+    if len(t) < 2:
+        raise ValueError(f"{name}: {len(t)} rows, nothing to check")
+
+    d = np.diff(t.to_numpy())
+    adj = int((d == GRID_STEP).sum())
+    frac = adj / len(d)
+    steps, counts = np.unique(d, return_counts=True)
+    order = np.argsort(counts)[::-1][:3]
+    common = ", ".join(f"{pd.Timedelta(steps[i])} x{counts[i]:,}" for i in order)
+
+    info = {"rows": len(t), "resolution": str(t.dtype), "adjacent": adj,
+            "adjacent_share": frac, "monotonic": bool(t.is_monotonic_increasing),
+            "unique": bool(t.is_unique), "common_steps": common}
+
+    if not t.is_monotonic_increasing:
+        raise ValueError(f"{name} is not sorted")
+    if not t.is_unique:
+        raise ValueError(f"{name} has duplicate timestamps")
+    if adj == 0:
+        raise ValueError(
+            f"{name}: no two consecutive rows are {pd.Timedelta(GRID_STEP)} "
+            f"apart. Resolution is {t.dtype}; observed steps: {common}. "
+            f"Either the grid is not {GRID_SECONDS}s or a unit conversion "
+            f"has gone wrong upstream.")
+    if frac < min_adjacent:
+        raise ValueError(
+            f"{name}: only {frac:.1%} of consecutive rows are one grid step "
+            f"apart, expected at least {min_adjacent:.0%}. Observed steps: "
+            f"{common}.")
+    return info
 
 
 def closed_mask(df, cols=PAIRS, min_run=600):
@@ -244,8 +324,11 @@ def episodes(series, threshold, merge_gap="60s", min_seconds=5,
     t = s.index
     over = (s.abs() > threshold).to_numpy()
 
-    jump = np.zeros(len(s), dtype=bool)
-    jump[1:] = np.diff(t.asi8) > GRID_NS
+    # A run may only continue where the next row is the next grid second.
+    # `adjacent` is False at position 0 by convention; a jump before the
+    # first row is meaningless, so it is cleared here.
+    jump = ~adjacent(t)
+    jump[0] = False
 
     starts, ends = _runs(over)
     pieces = []
