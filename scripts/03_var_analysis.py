@@ -119,8 +119,6 @@ Outputs
 
 from __future__ import annotations
 
-import time
-
 from typing import NamedTuple, Optional
 
 import re
@@ -798,10 +796,10 @@ def episode_decay(d, labels, n_regimes, tail=EPISODE_TAIL_SECONDS):
     """
     path = DAT_DIR / "01_episodes.parquet"
     if not path.exists():
-        return None
+        return None, None
     ep = pd.read_parquet(path)
     if not len(ep):
-        return None
+        return None, None
 
     b = d["basis"].to_numpy()
     adj = adjacent(d.index)
@@ -809,7 +807,7 @@ def episode_decay(d, labels, n_regimes, tail=EPISODE_TAIL_SECONDS):
     starts = pd.DatetimeIndex(d.index).get_indexer(pd.DatetimeIndex(ep["start"]))
     ends = pd.DatetimeIndex(d.index).get_indexer(pd.DatetimeIndex(ep["end"]))
 
-    rows = []
+    rows, paths = [], []
     for a, e in zip(starts, ends):
         if a < 0 or e < a:
             continue
@@ -833,9 +831,18 @@ def episode_decay(d, labels, n_regimes, tail=EPISODE_TAIL_SECONDS):
             "seconds_to_half": float(hit[0]) if hit.size else np.nan,
             "censored": not bool(hit.size),
         })
+        # The whole decay, not only its half point, so the figure can show
+        # the measured path against the fitted one. NaN past the break, so
+        # the median at each horizon is taken over episodes that were
+        # actually observed that far and not over an assumption.
+        trace = np.full(tail + 1, np.nan)
+        trace[:window.size] = window / peak
+        paths.append(trace)
 
     out = pd.DataFrame(rows)
-    return out if len(out) else None
+    if not len(out):
+        return None, None
+    return out, np.vstack(paths)
 
 
 # ------------------------------------------------------------------- tables
@@ -996,7 +1003,7 @@ def panel_title(ax, title, note):
                 color="#666666", va="bottom", ha="left")
 
 
-def figure_error_correction(fits, names, colours):
+def figure_error_correction(fits, names, colours, measured=None):
     fig, ax = plt.subplots(1, 2, figsize=(10, 4.4),
                            gridspec_kw={"wspace": 0.26})
 
@@ -1058,8 +1065,26 @@ def figure_error_correction(fits, names, colours):
     ax[1].set_xlim(1, right)
     ax[1].set_xlabel("seconds since the dislocation opened")
     ax[1].set_ylabel("share of the dislocation still open")
+    # The measured decay, laid over the fitted one. These are two different
+    # quantities and the figure should say so rather than let a reader take
+    # the fitted curve for the answer: the solid line is the system's own
+    # slowest mode, which is how fast an average deviation from the day's
+    # level dies away, and the dashed line is what a large dislocation
+    # actually did. Where they disagree, the dashed line is the one with no
+    # lag order in it.
+    if measured:
+        for k, name in enumerate(names):
+            m = measured.get(name)
+            if m is None or not np.isfinite(m).any():
+                continue
+            h = np.arange(len(m))
+            ax[1].plot(h[1:], m[1:], lw=1.4, ls=(0, (3, 2)),
+                       color=colours[k], zorder=4)
+        ax[1].plot([], [], lw=1.4, ls=(0, (3, 2)), color=RULE,
+                   label="measured, episodes")
     panel_title(ax[1], "How long a dislocation survives",
-                "no further shocks; the fitted system left to run down")
+                "solid: the fitted system run down with no further shocks. "
+                "dashed: the episodes of 01, measured with a ruler")
     ax[1].legend(loc="upper right")
     save_fig(fig, "03_error_correction")
 
@@ -1205,7 +1230,7 @@ def audit(fits, names, prefix="03_"):
 def main():
     make_dirs()
     set_style()
-    start_time = time.perf_counter()
+
     # ------------------------------------------------------------- load
     print("load")
     path = DAT_DIR / "01_clean.parquet"
@@ -1480,7 +1505,14 @@ def main():
 
     # ------------------------------------------------- model-free check
     print("episodes")
-    decay = episode_decay(d, labels, n_regimes)
+    decay, decay_paths = episode_decay(d, labels, n_regimes)
+    measured = {}
+    if decay is not None:
+        for k, name in enumerate(names):
+            rowsel = (decay["regime"] == k).to_numpy()
+            if rowsel.any():
+                with np.errstate(invalid="ignore"):
+                    measured[name] = np.nanmedian(decay_paths[rowsel], axis=0)
     if decay is None:
         print(" 01_episodes.parquet absent; the model-free check is omitted")
     else:
@@ -1763,7 +1795,7 @@ def main():
 
     # --------------------------------------------------------- figures
     print("figures")
-    figure_error_correction(fits, names, colours)
+    figure_error_correction(fits, names, colours, measured)
     figure_closure_speed(daily, fits, names, colours, boundaries)
     figure_diagnostics(fits, names, colours, acf, lags)
 
@@ -1806,9 +1838,7 @@ def main():
 
     print("checks")
     audit(fits, names)
-    end_time = time.perf_counter()
-    elapsed_time = end_time - start_time
-    print(f"Execution time: {elapsed_time:.4f} seconds")
+
 
 if __name__ == "__main__":
     main()
