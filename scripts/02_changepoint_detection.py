@@ -68,10 +68,15 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import os
+import time
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from functools import lru_cache
+
 from scipy.special import gammaln, logsumexp
 
 from utils import (
@@ -80,7 +85,7 @@ from utils import (
     annotate_interval, highlight_span,
     adjacent, check_grid,
     DAT_DIR, BOJ_SHOCK, TZ_LABEL, ROLLOVER_START, ROLLOVER_END,
-    REGIME_COLOUR, FOUND, MUTE, RULE,
+    REGIME_COLOUR, regime_colours, MUTE, RULE,
 )
 
 # ------------------------------------------------------------- constants
@@ -122,6 +127,30 @@ MIN_SEG_HOURS = 6.0              # varied at 3, 12 and 24 h in 02_sensitivity
 
 CRED_MASS = 0.95                 # convention
 
+# convention. Grid for the AR(1) error coefficient, marginalised under a
+# uniform prior. Includes 0, so the independent-error model is nested and
+# the data is free to return it. The upper end stops short of 1: at rho
+# near unity a level shift and a random walk are indistinguishable, and
+# admitting that region buys nothing but an unidentified mode.
+RHO_GRID = np.linspace(0.0, 0.90, 8)
+
+# convention. Buckets after a session reopen treated as a thin-liquidity
+# ramp and given their own additive offset in `deseason`. Four hours covers
+# the Sunday evening reopen before Tokyo arrives. Varied in 02_sensitivity,
+# including 0, which switches the adjustment off entirely.
+REOPEN_BUCKETS = 4
+
+# convention. Null-calibration replicates. 200 is enough to place the
+# observed evidence against the null to a couple of percent, which is all
+# the precision the statement needs.
+# Set to 0 while iterating: it is roughly three quarters of the runtime
+# and nothing else depends on it.
+# Set to 0 while iterating: the calibration is roughly 70% of the runtime
+# and nothing else depends on it. The environment variable exists so the
+# test harness can run every model path cheaply without editing the file.
+NULL_DRAWS = int(os.environ.get("CP_NULL_DRAWS", 100))
+NULL_SEED = 20240731
+
 # Prior. k0 is the weight on the segment mean expressed in observations, so
 # 0.01 is one hundredth of an hour's worth of information: weak, but proper,
 # which matters because improper priors make the model comparison
@@ -158,27 +187,67 @@ class Fit(NamedTuple):
     ret: pd.Timestamp
     ret_lo: pd.Timestamp
     ret_hi: pd.Timestamp
+    rho: float                # posterior mean AR(1) coefficient of the errors
+    contiguous: np.ndarray    # bucket follows the previous one in clock time
 
 
 # ------------------------------------------------------- marginal likelihood
 
-def _segment_evidence(n, s, ss, m0, k0, a0, b0):
+def _segment_evidence(n, sww, swz, szz, m0, k0, a0, b0):
     """
-    log p(y_segment) with (mu, sigma^2) integrated out under a
-    Normal-Inverse-Gamma prior. Vectorised over segments; n, s and ss are
-    the count, sum and sum of squares, each obtainable in O(1) from
-    cumulative sums, which is what makes enumeration cheap.
+    log p(segment) with (mu, sigma^2) integrated out under a
+    Normal-Inverse-Gamma prior.
+
+    The segment is written as a one-regressor regression z_t = mu w_t + e_t,
+    e_t ~ N(0, sigma^2). With w_t = 1 this is the plain iid segment mean and
+    the formula reduces to the familiar one; the general form is what lets
+    the AR(1) transform below reuse it unchanged.
+
+    Vectorised over segments. n, sum w^2, sum wz and sum z^2 are each
+    obtainable in O(1) from cumulative sums, which is what makes exhaustive
+    enumeration cheap enough to be worth preferring over a sampler.
     """
     n = np.asarray(n, dtype=float)
-    kn = k0 + n
+    kn = k0 + sww
     an = a0 + n / 2.0
-    mean = s / n
-    sse = np.maximum(ss - n * mean ** 2, 0.0)
-    bn = b0 + 0.5 * sse + (k0 * n * (mean - m0) ** 2) / (2.0 * kn)
+    mn = (k0 * m0 + swz) / kn
+    bn = b0 + 0.5 * (szz + k0 * m0 ** 2 - kn * mn ** 2)
+    bn = np.maximum(bn, np.finfo(float).tiny)
     return (gammaln(an) - gammaln(a0)
             + a0 * np.log(b0) - an * np.log(bn)
             + 0.5 * (np.log(k0) - np.log(kn))
             - 0.5 * n * np.log(2.0 * np.pi))
+
+
+def ar_transform(v, contiguous, rho):
+    """
+    Whiten an AR(1) series into z_t = mu w_t + e_t with e_t iid N(0, s^2).
+
+    Two cases. Where the previous bucket is adjacent in clock time the
+    one-step-ahead form applies, z = y - rho y_prev against w = 1 - rho.
+    Where it is not — the first bucket of the sample, and the first bucket
+    after every closure — there is no predecessor, so the stationary
+    marginal is used instead, scaled by sqrt(1 - rho^2) to put it on the
+    same sigma. Both are exact; mixing them is what makes the likelihood
+    correct across a market that shuts every weekend.
+
+    Returned as (conditional, stationary) pairs so that a segment can use
+    the stationary form at its own first bucket, whose predecessor belongs
+    to a different segment with a different mean.
+    """
+    v = np.asarray(v, dtype=float)
+    root = np.sqrt(max(1.0 - rho ** 2, 1e-12))
+    z_s = v * root
+    w_s = np.full(v.size, root)
+
+    z_c = np.empty_like(v)
+    w_c = np.empty_like(v)
+    z_c[0], w_c[0] = z_s[0], w_s[0]
+    z_c[1:] = v[1:] - rho * v[:-1]
+    w_c[1:] = 1.0 - rho
+    gap = ~np.asarray(contiguous, dtype=bool)
+    z_c[gap], w_c[gap] = z_s[gap], w_s[gap]
+    return z_c, w_c, z_s, w_s
 
 
 def credible_window(p, mass=CRED_MASS):
@@ -205,13 +274,94 @@ def credible_window(p, mass=CRED_MASS):
 
 # --------------------------------------------------------------- estimation
 
-def fit_changepoint(y, min_seg, k0=PRIOR_K0, a0=PRIOR_A0) -> Fit:
+@lru_cache(maxsize=8)
+def _pair_grid(n, min_seg):
+    """
+    Admissible ordered changepoint pairs. Cached: the enumeration depends
+    only on the sample length and the minimum segment, so the rho grid and
+    the null replicates all reuse one copy instead of rebuilding a pair of
+    (n+1)^2 integer arrays on every call.
+    """
+    grid = np.arange(n + 1)
+    T1, T2 = np.meshgrid(grid, grid, indexing="ij")
+    ok = (T1 >= min_seg) & (T2 - T1 >= min_seg) & (n - T2 >= min_seg)
+    return T1[ok].copy(), T2[ok].copy()
+
+
+def _fit_given_rho(v, contiguous, n, min_seg, m0, k0, a0, b0, rho):
+    """Model evidences and changepoint weights at one value of rho."""
+    z_c, w_c, z_s, w_s = ar_transform(v, contiguous, rho)
+
+    # Cumulative sums of the conditional form. Position a of any segment is
+    # substituted with the stationary form by _stats below.
+    c_ww = np.concatenate([[0.0], np.cumsum(w_c ** 2)])
+    c_wz = np.concatenate([[0.0], np.cumsum(w_c * z_c)])
+    c_zz = np.concatenate([[0.0], np.cumsum(z_c ** 2)])
+
+    def _stats(a, b):
+        """(n, sum w^2, sum wz, sum z^2) over [a, b), stationary at a."""
+        a = np.asarray(a); b = np.asarray(b)
+        a1 = np.minimum(a + 1, b)
+        return (b - a,
+                w_s[a] ** 2 + (c_ww[b] - c_ww[a1]),
+                w_s[a] * z_s[a] + (c_wz[b] - c_wz[a1]),
+                z_s[a] ** 2 + (c_zz[b] - c_zz[a1]))
+
+    def inside(a, b):
+        return _segment_evidence(*_stats(a, b), m0, k0, a0, b0)
+
+    log_z0 = float(inside(np.array([0]), np.array([n]))[0])
+
+    t = np.arange(min_seg, n - min_seg + 1)
+    ll1 = inside(np.zeros_like(t), t) + inside(t, np.full_like(t, n))
+    log_z1 = float(logsumexp(ll1) - np.log(t.size))
+
+    a1, a2 = _pair_grid(n, min_seg)
+    zeros, full = np.zeros_like(a1), np.full_like(a2, n)
+
+    # M2 and M3 share their segments: both need [0, a1), [a1, a2) and
+    # [a2, n). M2 pools the outer two into one calm regime, M3 gives them
+    # separate means. Computing the three sufficient-statistic blocks once
+    # and combining them is the whole difference between five passes over
+    # half a million pairs and three.
+    sA = _stats(zeros, a1)                       # left block
+    sB = _stats(a1, a2)                          # middle block
+    sC = _stats(a2, full)                        # right block
+
+    mid = _segment_evidence(*sB, m0, k0, a0, b0)
+    ll3 = (_segment_evidence(*sA, m0, k0, a0, b0) + mid
+           + _segment_evidence(*sC, m0, k0, a0, b0))
+    ll2 = mid + _segment_evidence(*[x + z for x, z in zip(sA, sC)],
+                                  m0, k0, a0, b0)
+    log_z2 = float(logsumexp(ll2) - np.log(a1.size))
+    log_z3 = float(logsumexp(ll3) - np.log(a1.size))
+
+    return dict(log_z=np.array([log_z0, log_z1, log_z2, log_z3]),
+                t=t, ll1=ll1, a1=a1, a2=a2, ll2=ll2, ll3=ll3)
+
+
+def fit_changepoint(y, min_seg, k0=PRIOR_K0, a0=PRIOR_A0,
+                    rho_grid=RHO_GRID, contiguous=None, force=None) -> Fit:
     """
     Exact posterior over M0-M3 and over the changepoints within each.
 
     `y` is a Series indexed by bucket start time. `min_seg` is the shortest
     admissible segment in buckets: it keeps segments estimable and stops the
     two-changepoint models buying evidence with a single outlying hour.
+
+    Within a segment the errors are AR(1). This is not a refinement. With
+    independent errors the model treats a run of above-average hours as a
+    level shift, and hourly dispersion is strongly autocorrelated because
+    volatility clusters, so the independent version selects an excursion on
+    data containing no changepoint at all — at rho = 0.5 it does so in
+    roughly four series out of five. See the null calibration written to
+    02_null_calibration.csv.
+
+    rho is marginalised over a grid rather than profiled, so the reported
+    evidence accounts for not knowing it. Conditional on rho the segment
+    likelihood is still a one-regressor conjugate regression, so the
+    enumeration stays exact and the whole cost is len(rho_grid) times the
+    independent model.
     """
     idx = pd.DatetimeIndex(y.index)
     v = np.asarray(y, dtype=float)
@@ -219,49 +369,50 @@ def fit_changepoint(y, min_seg, k0=PRIOR_K0, a0=PRIOR_A0) -> Fit:
     if n < 3 * min_seg + 3:
         raise ValueError(f"{n} buckets is too few for min_seg={min_seg}")
 
+    if contiguous is None:
+        step = pd.Timedelta(BUCKET) if len(idx) < 2 else idx.to_series().diff().median()
+        contiguous = np.zeros(n, dtype=bool)
+        contiguous[1:] = (np.diff(idx.to_numpy()) == step.to_timedelta64())
+    contiguous = np.asarray(contiguous, dtype=bool)
+
     m0 = float(np.mean(v))
     b0 = float((a0 - 1.0) * np.var(v, ddof=1))
-    cs = np.concatenate([[0.0], np.cumsum(v)])
-    cs2 = np.concatenate([[0.0], np.cumsum(v ** 2)])
 
-    def inside(a, b):
-        return _segment_evidence(b - a, cs[b] - cs[a], cs2[b] - cs2[a],
-                                 m0, k0, a0, b0)
+    rho_grid = np.asarray(rho_grid, dtype=float)
+    fits = [_fit_given_rho(v, contiguous, n, min_seg, m0, k0, a0, b0, r)
+            for r in rho_grid]
 
-    def outside(a, b):
-        """Evidence for everything not in [a, b) — the calm data under M2."""
-        return _segment_evidence(n - (b - a),
-                                 cs[n] - (cs[b] - cs[a]),
-                                 cs2[n] - (cs2[b] - cs2[a]),
-                                 m0, k0, a0, b0)
-
-    zero = np.array([0])
-    full = np.array([n])
-    log_z0 = float(inside(zero, full)[0])
-
-    # one changepoint
-    t = np.arange(min_seg, n - min_seg + 1)
-    ll1 = inside(np.zeros_like(t), t) + inside(t, np.full_like(t, n))
-    log_z1 = float(logsumexp(ll1) - np.log(t.size))
-    w1 = np.exp(ll1 - logsumexp(ll1))
-
-    # two changepoints, enumerated as ordered pairs
-    grid = np.arange(n + 1)
-    T1, T2 = np.meshgrid(grid, grid, indexing="ij")
-    ok = ((T1 >= min_seg) & (T2 - T1 >= min_seg) & (n - T2 >= min_seg))
-    a1, a2 = T1[ok], T2[ok]
-    del T1, T2, ok
-
-    ll2 = inside(a1, a2) + outside(a1, a2)
-    ll3 = (inside(np.zeros_like(a1), a1) + inside(a1, a2)
-           + inside(a2, np.full_like(a2, n)))
-    log_z2 = float(logsumexp(ll2) - np.log(a1.size))
-    log_z3 = float(logsumexp(ll3) - np.log(a1.size))
-
-    log_z = pd.Series([log_z0, log_z1, log_z2, log_z3], index=MODELS)
+    # Marginalise rho under a uniform prior on the grid.
+    stack = np.array([f["log_z"] for f in fits])              # (rho, model)
+    log_prior = -np.log(len(rho_grid))
+    log_z_arr = logsumexp(stack + log_prior, axis=0)
+    log_z = pd.Series(log_z_arr, index=MODELS)
     p_model = pd.Series(np.exp(log_z - logsumexp(log_z.to_numpy())),
                         index=MODELS)
     best = str(p_model.idxmax())
+    if force is not None:
+        # Conditioning on a model rather than selecting one. Used by the
+        # null calibration, which needs the largest excursion noise can
+        # produce, not only those rare replicates where noise happens to
+        # win the model comparison outright.
+        best = force
+
+    # Posterior over rho given the selected model, and the rho weights used
+    # to average the changepoint marginals.
+    bi = MODELS.index(best)
+    log_w_rho = stack[:, bi] + log_prior
+    w_rho = np.exp(log_w_rho - logsumexp(log_w_rho))
+    rho_hat = float(np.sum(w_rho * rho_grid))
+
+    t = fits[0]["t"]
+    a1, a2 = fits[0]["a1"], fits[0]["a2"]
+    if best == MODELS[1]:
+        w1 = sum(wr * np.exp(f["ll1"] - logsumexp(f["ll1"]))
+                 for wr, f in zip(w_rho, fits))
+    key = "ll2" if best == MODELS[2] else "ll3"
+    if best in (MODELS[2], MODELS[3]):
+        w = sum(wr * np.exp(f[key] - logsumexp(f[key]))
+                for wr, f in zip(w_rho, fits))
 
     # pointwise regime probabilities and changepoint marginals
     p_onset = np.zeros(n + 1)
@@ -276,8 +427,6 @@ def fit_changepoint(y, min_seg, k0=PRIOR_K0, a0=PRIOR_A0) -> Fit:
         seg_prob = np.column_stack([1.0 - after, after])
 
     else:
-        w = np.exp((ll2 if best == MODELS[2] else ll3)
-                   - logsumexp(ll2 if best == MODELS[2] else ll3))
         p_onset = np.bincount(a1, weights=w, minlength=n + 1)
         p_return = np.bincount(a2, weights=w, minlength=n + 1)
         if best == MODELS[2]:
@@ -306,7 +455,8 @@ def fit_changepoint(y, min_seg, k0=PRIOR_K0, a0=PRIOR_A0) -> Fit:
     ret, ret_lo, ret_hi = summarise(p_return)
 
     return Fit(idx, log_z, p_model, best, seg_prob, p_onset, p_return,
-               onset, onset_lo, onset_hi, ret, ret_lo, ret_hi)
+               onset, onset_lo, onset_hi, ret, ret_lo, ret_hi,
+               rho_hat, contiguous)
 
 
 # ------------------------------------------------------------ feature build
@@ -396,13 +546,39 @@ def bucket_features(d, rollover, freq=BUCKET, with_micro=False,
     return out, dropped
 
 
-def deseason(series, freq=BUCKET):
-    """
-    Remove the time-of-day profile.
+def session_age(index, freq=BUCKET):
+    """Buckets elapsed since the session opened; 0 at each reopen."""
+    idx = pd.DatetimeIndex(index)
+    step = pd.Timedelta(freq).to_timedelta64()
+    contig = np.zeros(len(idx), dtype=bool)
+    if len(idx) > 1:
+        contig[1:] = np.diff(idx.to_numpy()) == step
+    age = np.zeros(len(idx), dtype=int)
+    for i in range(1, len(idx)):
+        age[i] = age[i - 1] + 1 if contig[i] else 0
+    return age, contig
 
-    Estimated over the full sample, so it cannot be accused of having been
-    fitted either side of a candidate date. Day of week is left in the
-    residual variance: with nine weeks the cells are too thin to estimate
+
+def deseason(series, freq=BUCKET, reopen_buckets=REOPEN_BUCKETS):
+    """
+    Remove the time-of-day profile and the reopen ramp.
+
+    Both are properties of the clock rather than of the market, and both
+    are removed for the same reason the rollover window is excluded
+    outright: liquidity is thin, the basis widens mechanically, and a
+    changepoint model will otherwise place a boundary on the artefact.
+
+    The reopen term is the one that earns its place. A weekend closure is
+    followed by a thin Sunday evening, so the first buckets of every week
+    sit systematically high. Without this adjustment a regime that truly
+    ended during a closure gets recorded a few hours after the reopen —
+    the model cannot put a changepoint inside a gap where no bucket
+    exists, so it puts it at the first bucket that looks normal. Estimated
+    across every session in the sample, so no single weekend drives it.
+
+    Both profiles are estimated over the full sample and so cannot have
+    been fitted either side of a candidate date. Day of week is left in the
+    residual variance: with nine weeks the cells are too thin to estimate,
     and the omission inflates within-segment variance, which is
     conservative.
     """
@@ -414,7 +590,17 @@ def deseason(series, freq=BUCKET):
     minutes = int(pd.Timedelta(freq).total_seconds() // 60)
     slot = pd.Index((s.index.hour * 60 + s.index.minute) // minutes)
     profile = s.groupby(slot.to_numpy()).median()
-    return s - profile.reindex(slot).to_numpy(), profile
+    r = s - profile.reindex(slot).to_numpy()
+
+    if reopen_buckets <= 0:
+        return r, profile, pd.Series(dtype=float)
+
+    age, _ = session_age(s.index, freq)
+    band = np.minimum(age, reopen_buckets)
+    ramp = pd.Series(r.to_numpy()).groupby(band).median()
+    # Settled hours define the baseline, so only the reopen band moves.
+    ramp = ramp - ramp.get(reopen_buckets, 0.0)
+    return r - ramp.reindex(band).to_numpy(), profile, ramp
 
 
 # ---------------------------------------------------------------- reporting
@@ -423,11 +609,101 @@ def fmt(ts):
     return "—" if pd.isna(ts) else f"{ts:%d %b %H:%M}"
 
 
-def variant_row(name, fit: Fit):
+def num(x, spec=".2f"):
+    """
+    Format a number for a table, or an em dash if it is not defined.
+
+    Quantities like a dispersion ratio have no value when the selected
+    model has one segment, and NaN written into a LaTeX table that the
+    report \\input s renders as a blank cell or the literal 'nan'. An em
+    dash says 'not applicable' and is the only thing that should ever
+    reach the report in place of a number.
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "—"
+    return "—" if not np.isfinite(v) else format(v, spec)
+
+
+def modal_span_hours(fit: Fit, freq=BUCKET) -> float:
+    """Open-market hours between the modal changepoints."""
+    if pd.isna(fit.onset) or pd.isna(fit.ret):
+        return float("nan")
+    a = int(np.searchsorted(fit.index, fit.onset))
+    b = int(np.searchsorted(fit.index, fit.ret))
+    return (b - a) * pd.Timedelta(freq).total_seconds() / 3600.0
+
+
+def change_bracket(fit: Fit, p, freq=BUCKET):
+    """
+    When the change happened, honestly.
+
+    A changepoint at position k says the new segment opens with bucket k.
+    All the data licenses is that the change happened after the previous
+    retained bucket ended and by the time bucket k started. Where those two
+    instants are one bucket apart that is the bucket; where a market
+    closure sits between them it is the whole closure, and quoting an hour
+    would be inventing resolution the sample does not contain.
+
+    This matters here: a regime that ends over a weekend can only be
+    recorded at the Sunday reopen, and the credible interval in bucket
+    space is then spuriously narrow.
+    """
+    if p is None or not np.isfinite(p).any() or p.sum() <= 0:
+        return "—", False
+    idx, step = fit.index, pd.Timedelta(freq)
+    n = len(idx)
+    lo, hi = credible_window(p[:n])
+    lo, hi = min(lo, n - 1), min(hi, n - 1)
+    first = idx[lo - 1] + step if lo > 0 else idx[0]
+    last = idx[hi]
+    spans = bool((~fit.contiguous[lo:hi + 1]).any()) or (first < idx[lo])
+    if last - first <= step:
+        return fmt(last), spans
+    return f"{fmt(first)} – {fmt(last)}", spans
+
+
+def within_ratio(fit: Fit, y) -> float:
+    """
+    Size of the shift the model fitted, as a multiple: the widest segment
+    against everything else.
+
+    Cut at the reported changepoints rather than at the pointwise
+    posterior. Two reasons. Under M3 the highest segment label is the calm
+    tail, so keying on the label compares the quiet end of the sample
+    against the rest and returns a number below one. And where the
+    posterior is diffuse — which is exactly the case under the null — no
+    bucket carries more than half its mass, every bucket takes label 0,
+    and the ratio comes back undefined for the replicates that most need
+    a value. Cutting at the modal changepoints always yields a number, and
+    it is the number a reader would compute from the reported dates.
+    """
+    v = np.asarray(y, dtype=float)
+    idx, n = fit.index, len(fit.index)
+    if pd.isna(fit.onset):
+        return float("nan")
+    a = int(np.searchsorted(idx, fit.onset))
+    b = n if pd.isna(fit.ret) else int(np.searchsorted(idx, fit.ret))
+    lab = np.zeros(n, dtype=int)
+    lab[a:b] = 1
+    lab[b:] = 2 if fit.best == MODELS[3] else 0
+    means = {k: v[lab == k].mean() for k in np.unique(lab)}
+    if len(means) < 2:
+        return float("nan")
+    hot = lab == max(means, key=means.get)
+    if not hot.any() or hot.all():
+        return float("nan")
+    return float(np.exp(v[hot].mean() - v[~hot].mean()))
+
+
+def variant_row(name, fit: Fit, y=None):
     return {
         "variant": name,
         "selected": fit.best.split(" ", 1)[0],
         "P(selected)": float(fit.p_model.max()),
+        "ratio": within_ratio(fit, y) if y is not None else float("nan"),
+        "rho": float(fit.rho),
         "onset": fmt(fit.onset),
         "return": fmt(fit.ret),
     }
@@ -476,7 +752,10 @@ def regime_summary(d, rollover, labels, names, episodes):
             "seconds": int(sel.sum()),
             "basis MAD (pips)": robust_scale(x),
             "basis sd (pips)": float(np.std(x, ddof=1)) if x.size > 1 else np.nan,
-            "p99.9 |basis| (pips)": float(np.quantile(np.abs(x), 0.999)),
+            # A segment can end up with no seconds when its posterior never
+            # wins the pointwise argmax, and np.quantile raises on empty.
+            "p99.9 |basis| (pips)": (float(np.quantile(np.abs(x), 0.999))
+                                     if x.size else np.nan),
             "max |basis| (pips)": float(np.abs(x).max()) if x.size else np.nan,
             "rho_1 of increments": acf1(dx[sel]),
             "Roll noise c (pips)": roll_noise(dx[sel]),
@@ -523,7 +802,7 @@ def main():
           f"or fewer than {MIN_MOVES_PER_BUCKET} moves)")
 
     y_raw = np.log(feat["mad"])
-    y, profile = deseason(y_raw)
+    y, profile, ramp = deseason(y_raw)
     amp = float(np.exp(profile.max() - profile.min()))
     print(f" diurnal profile removed; peak-to-trough {amp:.2f}x in dispersion")
 
@@ -600,29 +879,83 @@ def main():
         label="tab:model_evidence",
     )
 
-    ratio = lambda row: (stats.loc[row, names[1]] / stats.loc[row, names[0]]
-                         if len(names) > 1 else np.nan)
+    def ratio(row):
+        """
+        Widest segment against narrowest, for one row of regime_stats.
+
+        Defined this way rather than as segment 2 over segment 1 so that it
+        means the same thing whatever model was selected. With three
+        segments the calm tail, not the calm opening, is often the
+        narrowest, and a fixed pair of indices would silently compare the
+        wrong two.
+        """
+        if len(names) < 2 or row not in stats.index:
+            return np.nan
+        v = pd.to_numeric(stats.loc[row, names], errors="coerce").dropna()
+        return np.nan if len(v) < 2 or v.min() == 0 else v.max() / v.min()
+    # Reported as the span the data brackets, not as the modal bucket. A
+    # change falling inside a closure can only be recorded at the reopen,
+    # and quoting that hour would claim resolution the sample lacks.
+    onset_win, onset_gap = change_bracket(fit, fit.p_onset)
+    ret_win, ret_gap = change_bracket(fit, fit.p_return)
+
+    def _median_cp(p):
+        """Posterior median changepoint, in bucket time."""
+        if p is None or not np.isfinite(p).any() or p.sum() <= 0:
+            return pd.NaT
+        m = len(fit.index)
+        c = np.cumsum(p[:m]) / p[:m].sum()
+        return fit.index[int(min(np.searchsorted(c, 0.5), m - 1))]
+
+    # Mode and median both, because they can disagree and the disagreement
+    # is itself the result. Where the onset posterior is bimodal its mode
+    # sits on whichever spike is taller while half the mass lies elsewhere.
+    # The per-second labels are the median segmentation — a bucket is
+    # called elevated when more than half the posterior says it is — so
+    # reporting only the mode leaves the headline describing a different
+    # window from the one every downstream script consumes.
+    onset_med, ret_med = _median_cp(fit.p_onset), _median_cp(fit.p_return)
+    core_h = (int((fit.seg_prob.argmax(1) == 1).sum())
+              * pd.Timedelta(BUCKET).total_seconds() / 3600.0)
+
     head = {
         "selected model": fit.best,
-        "posterior probability": f"{fit.p_model.max():.3f}",
+        "posterior probability": num(fit.p_model.max(), ".3f"),
         f"log Bayes factor vs {runner_up.split(' ', 1)[0]}": f"{bf:+.1f}",
-        "onset": fmt(fit.onset),
-        f"onset {CRED_MASS:.0%} interval": f"{fmt(fit.onset_lo)} – {fmt(fit.onset_hi)}",
+        "AR(1) rho of the errors": num(fit.rho),
+        "onset, posterior mode": fmt(fit.onset),
+        "onset, posterior median": fmt(onset_med),
+        "onset 95% window": onset_win + (" (spans a closure)" if onset_gap else ""),
     }
     if fit.p_return is not None:
-        span_h = (fit.ret - fit.onset).total_seconds() / 3600.0
         head.update({
-            "return": fmt(fit.ret),
-            f"return {CRED_MASS:.0%} interval": f"{fmt(fit.ret_lo)} – {fmt(fit.ret_hi)}",
-            "duration (hours)": f"{span_h:.0f}",
+            "return, posterior mode": fmt(fit.ret),
+            "return, posterior median": fmt(ret_med),
+            "return 95% window": ret_win + (" (spans a closure)" if ret_gap else ""),
+            "elevated open-market hours, median segmentation (the labels)":
+                num(core_h, ".0f"),
+            "elevated open-market hours, modal segmentation":
+                num(modal_span_hours(fit), ".0f"),
         })
     head.update({
         "BOJ decision (reference)": f"{BOJ_SHOCK:%d %b %H:%M}",
-        "onset relative to BOJ (hours)":
-            f"{(fit.onset - BOJ_SHOCK).total_seconds() / 3600:+.1f}",
-        "dispersion ratio (MAD)": f"{ratio('basis MAD (pips)'):.2f}",
-        "microstructure noise ratio (Roll c)": f"{ratio('Roll noise c (pips)'):.2f}",
-        "half-life ratio": f"{ratio('half-life (s)'):.2f}",
+        "onset relative to BOJ, mode (hours)":
+            ("—" if pd.isna(fit.onset) else
+             f"{(fit.onset - BOJ_SHOCK).total_seconds() / 3600:+.1f}"),
+        "onset relative to BOJ, median (hours)":
+            ("—" if pd.isna(onset_med) else
+             f"{(onset_med - BOJ_SHOCK).total_seconds() / 3600:+.1f}"),
+        # Two different quantities, both previously called "dispersion".
+        # The first is what the model fitted: how much wider the basis got
+        # inside a given hour. The second pools every second in the regime
+        # around one median, so it also absorbs the basis level wandering
+        # between hours. The gap between them is that wandering, and it is
+        # the same thing the half-life column reports.
+        "within-hour dispersion ratio (fitted)": num(within_ratio(fit, y)),
+        "pooled dispersion ratio, widest / narrowest segment (MAD)":
+            num(ratio("basis MAD (pips)")),
+        "microstructure noise ratio (Roll c)": num(ratio("Roll noise c (pips)")),
+        "half-life ratio": num(ratio("half-life (s)")),
     })
     headline = pd.DataFrame({"value": pd.Series(head)})
     save_table(
@@ -638,54 +971,66 @@ def main():
 
     # ------------------------------------------------ sensitivity
     print("sensitivity")
-    rows = [variant_row("baseline (1h, deseasonalised log MAD)", fit)]
+    rows = [variant_row("baseline (1h, deseasonalised log MAD)", fit, y)]
 
     rows.append(variant_row("no diurnal adjustment",
-                            fit_changepoint(y_raw, min_seg)))
+                            fit_changepoint(y_raw, min_seg), y_raw))
+    y_iqr = deseason(np.log(feat["iqr"]))[0]
     rows.append(variant_row("log IQR instead of log MAD",
-                            fit_changepoint(deseason(np.log(feat["iqr"]))[0],
-                                            min_seg)))
+                            fit_changepoint(y_iqr, min_seg), y_iqr))
+
+    # Switching the reopen adjustment off. If the return date moves to a
+    # Sunday evening without it, the boundary was tracking thin post-
+    # weekend liquidity rather than the market returning to normal.
+    y_nr = deseason(y_raw, reopen_buckets=0)[0]
+    rows.append(variant_row("no session-reopen adjustment",
+                            fit_changepoint(y_nr, min_seg), y_nr))
     for freq, label in [("30min", "30-minute buckets"), ("2h", "2-hour buckets")]:
         f2, _ = bucket_features(d, roll, freq)
         y2 = deseason(np.log(f2["mad"]), freq)[0]
         m2 = max(2, int(round(MIN_SEG_HOURS
                               / (pd.Timedelta(freq).total_seconds() / 3600))))
-        rows.append(variant_row(label, fit_changepoint(y2, m2)))
+        rows.append(variant_row(label, fit_changepoint(y2, m2), y2))
     for h in (3, 12, 24):
         rows.append(variant_row(f"minimum segment {h} h",
-                                fit_changepoint(y, max(2, int(h)))))
+                                fit_changepoint(y, max(2, int(h))), y))
     for k0 in (0.001, 0.1):
         rows.append(variant_row(f"prior k0 = {k0:g}",
-                                fit_changepoint(y, min_seg, k0=k0)))
+                                fit_changepoint(y, min_seg, k0=k0), y))
 
     # The admission filters. These decide which buckets the model ever
     # sees, so leaving them out of this table was the gap worth closing.
     for cov in (0.70, 0.98):
         f2, _ = bucket_features(d, roll, BUCKET, min_coverage=cov)
-        rows.append(variant_row(
-            f"bucket coverage >= {cov:.0%}",
-            fit_changepoint(deseason(np.log(f2["mad"]))[0], min_seg)))
+        yc = deseason(np.log(f2["mad"]))[0]
+        rows.append(variant_row(f"bucket coverage >= {cov:.0%}",
+                                fit_changepoint(yc, min_seg), yc))
     for mv in (10, 240):
         f2, _ = bucket_features(d, roll, BUCKET, min_moves=mv)
-        rows.append(variant_row(
-            f"minimum {mv} moves per bucket",
-            fit_changepoint(deseason(np.log(f2["mad"]))[0], min_seg)))
+        ym = deseason(np.log(f2["mad"]))[0]
+        rows.append(variant_row(f"minimum {mv} moves per bucket",
+                                fit_changepoint(ym, min_seg), ym))
 
     # A different feature entirely. Persistence is scale-free, so if it
     # breaks at the same hour the change is in the process and not in the
     # units.
     rho = feat["rho1"].dropna().clip(-0.999, 0.999)
+    y_rho = deseason(np.arctanh(rho))[0]
     rows.append(variant_row("feature: increment persistence (arctanh rho_1)",
-                            fit_changepoint(deseason(np.arctanh(rho))[0],
-                                            min_seg)))
+                            fit_changepoint(y_rho, min_seg), y_rho))
 
     # A confound rather than a robustness check. Quote intensity rises
     # through the sample; if the dispersion changepoint merely tracked it,
     # the two would coincide.
+    y_q = deseason(np.log(feat["move_share"]))[0]
     rows.append(variant_row("confound: quote-move rate",
-                            fit_changepoint(
-                                deseason(np.log(feat["move_share"]))[0],
-                                min_seg)))
+                            fit_changepoint(y_q, min_seg), y_q))
+
+    # The model this replaced. Kept in the table because the difference
+    # between these two rows is the whole reason for the AR(1) term.
+    rows.append(variant_row("independent errors (rho fixed at 0)",
+                            fit_changepoint(y, min_seg,
+                                            rho_grid=np.array([0.0])), y))
 
     # Placebo. The window must end before the decision, and the cut is
     # derived from BOJ_SHOCK rather than typed, for the same reason
@@ -699,9 +1044,14 @@ def main():
     pre = y.loc[(y.index + pd.Timedelta(BUCKET)) <= BOJ_SHOCK]
     rows.append(variant_row(
         f"placebo: truncated at {BOJ_SHOCK:%d %b %H:%M}, before the decision",
-        fit_changepoint(pre, min_seg)))
+        fit_changepoint(pre, min_seg), pre))
 
     sens = pd.DataFrame(rows).set_index("variant")
+    # A variant that selects M0 has no shift to size. Written as a dash for
+    # the same reason as everywhere else: NaN must not reach the report.
+    sens["ratio"] = [num(v, ".3f") for v in sens["ratio"]]
+    sens["rho"] = [num(v, ".2f") for v in sens["rho"]]
+    sens["P(selected)"] = [num(v, ".3f") for v in sens["P(selected)"]]
     save_table(
         sens, "02_sensitivity",
         caption=("Sensitivity of the selected segmentation. The first block "
@@ -709,14 +1059,117 @@ def main():
                  "prior and the minimum segment length, the third the "
                  "admission filters, the fourth replaces the feature. The "
                  "placebo row fits the sample truncated before the policy "
-                 "decision, where no change should be found."),
+                 "decision, where no change should be found. `ratio` is the "
+                 "size of the fitted shift as a multiple: selection without "
+                 "magnitude is not a finding, and Table~\\ref{tab:cp_null} "
+                 "gives the range of ratios that noise alone produces."),
         label="tab:cp_sensitivity",
     )
     print(sens.to_string(float_format=lambda v: f"{v:.3f}"))
 
+    # ------------------------------------------------ null calibration
+    #
+    # The Bayes factor answers "how much better is M2 than M0 on this
+    # series", which is not the question a reader has. The question is
+    # whether a series with no changepoint in it would have looked like
+    # this. Simulate under the fitted null — same length, same session
+    # structure, same AR(1) coefficient, no change anywhere — and read off
+    # how often the machinery finds an excursion regardless, and how large
+    # those spurious excursions are.
+    print("null calibration")
+    if NULL_DRAWS <= 0:
+        print("  skipped (NULL_DRAWS = 0)")
+    rng = np.random.default_rng(NULL_SEED)
+    yv = np.asarray(y, dtype=float)
+    resid = yv - np.array([yv[fit.seg_prob.argmax(1) == k].mean()
+                           for k in fit.seg_prob.argmax(1)])
+    sd = float(np.std(resid, ddof=1))
+    nb = len(yv)
+    # Length of the excursion actually estimated, in buckets: the null is
+    # asked for the best excursion of at least this long.
+    if pd.notna(fit.onset) and pd.notna(fit.ret):
+        null_seg = max(min_seg, int(np.searchsorted(fit.index, fit.ret)
+                                    - np.searchsorted(fit.index, fit.onset)))
+    else:
+        null_seg = min_seg
+
+    picks, ratios, bfs = [], [], []
+    t_null = time.perf_counter()
+    for j in range(NULL_DRAWS):
+        if j == 1:
+            each = time.perf_counter() - t_null
+            print(f"  {NULL_DRAWS} replicates at ~{each:.1f}s each, "
+                  f"about {each * NULL_DRAWS / 60:.0f} min "
+                  f"(set NULL_DRAWS = 0 to skip while iterating)")
+        elif j and j % 25 == 0:
+            print(f"  {j}/{NULL_DRAWS}")
+        e = rng.standard_normal(nb)
+        sim = np.empty(nb)
+        sim[0] = e[0]
+        for i in range(1, nb):
+            sim[i] = (fit.rho * sim[i - 1] + np.sqrt(1 - fit.rho ** 2) * e[i]
+                      if fit.contiguous[i] else e[i])
+        sim = pd.Series(sim * sd, index=fit.index)
+        g = fit_changepoint(sim, min_seg, contiguous=fit.contiguous)
+        picks.append(g.best)
+        bfs.append(float(g.log_evidence[MODELS[2]] - g.log_evidence[MODELS[0]]))
+        # Forced to M2 and floored at the length actually estimated, so
+        # every replicate contributes and the comparison is like for like.
+        # Unforced, the null selects no change in 98 replicates out of 100
+        # and the ratio is undefined for those; unmatched on duration, the
+        # null is free to find a six-hour window whose ratio a sustained
+        # fortnight could never reach, which understates the observation.
+        h = fit_changepoint(sim, null_seg, contiguous=fit.contiguous,
+                            force=MODELS[2])
+        r = within_ratio(h, sim)
+        if np.isfinite(r):
+            ratios.append(r)
+
+    if NULL_DRAWS <= 0:
+        picks, bfs, ratios = [MODELS[0]], [float("nan")], [float("nan")]
+
+    obs_ratio = within_ratio(fit, y)
+    obs_bf = float(fit.log_evidence[MODELS[2]] - fit.log_evidence[MODELS[0]])
+    ratios = np.array(ratios) if ratios else np.array([np.nan])
+    null = pd.DataFrame({"value": pd.Series({
+        "null replicates": f"{NULL_DRAWS}",
+        "AR(1) rho used": f"{fit.rho:.2f}",
+        "residual sd used": f"{sd:.3f}",
+        "P(any change selected | no change)":
+            f"{np.mean([p != MODELS[0] for p in picks]):.3f}",
+        "P(excursion selected | no change)":
+            f"{np.mean([p == MODELS[2] for p in picks]):.3f}",
+        "null log BF, 95th percentile": f"{np.percentile(bfs, 95):+.1f}",
+        "observed log BF (M2 vs M0)": f"{obs_bf:+.1f}",
+        f"null excursion of >= {null_seg} buckets, median ratio":
+            num(np.nanmedian(ratios) if np.isfinite(ratios).any() else np.nan, ".3f"),
+        f"null excursion of >= {null_seg} buckets, 95th percentile":
+            num(np.nanpercentile(ratios, 95) if np.isfinite(ratios).any() else np.nan, ".3f"),
+        "observed within-hour ratio": num(obs_ratio, ".3f"),
+        "observed ratio exceeds null replicates":
+            num(np.mean(obs_ratio > ratios[np.isfinite(ratios)])
+                if (np.isfinite(obs_ratio) and np.isfinite(ratios).any())
+                else np.nan, ".3f"),
+        "observed log BF exceeds null replicates":
+            f"{np.mean(obs_bf > np.array(bfs)):.3f}",
+    })})
+    save_table(
+        null, "02_null_calibration",
+        caption=("Calibration under the null. Series of the same length and "
+                 "session structure as the sample, with the fitted AR(1) "
+                 "coefficient and residual scale but no changepoint "
+                 "anywhere, refitted with the same machinery. The last row "
+                 "is the fraction of null replicates the observed evidence "
+                 "exceeds, and is the number to quote rather than the Bayes "
+                 "factor alone."),
+        label="tab:cp_null",
+    )
+    print(null.to_string())
+
     # ------------------------------------------------ figures
     print("figures")
     disp = pd.Series(np.exp(np.asarray(y, dtype=float)), index=fit.index)
+    disp_pips = feat["mad"].reindex(fit.index).to_numpy()   # for the legend
     full = pd.date_range(disp.index.min(), disp.index.max(), freq=BUCKET)
 
     fig = plt.figure(figsize=(10, 6.4))
@@ -724,16 +1177,25 @@ def main():
     ax0, ax1 = fig.add_subplot(gs[0]), fig.add_subplot(gs[1])
 
     if len(names) > 1:
-        for k, colour in zip(range(len(names)), REGIME_COLOUR):
+        for k, colour in zip(range(len(names)), regime_colours(len(names))):
             level = float(np.exp(np.asarray(y)[fit.seg_prob.argmax(1) == k].mean()))
+            # The plotted series is deseasonalised, so a value is a
+            # multiple of the typical dispersion for that time of day, not
+            # a pip count. The pip median is given alongside so the reader
+            # can anchor it without the axis claiming units it does not have.
+            pips = float(np.median(disp_pips[fit.seg_prob.argmax(1) == k]))
             ax0.axhline(level, color=colour, lw=1.2, zorder=2,
-                        label=f"{names[k]}: {level:.3f} pips")
+                        label=f"{names[k]}: {level:.2f}x  ({pips:.3f} pips)")
     if fit.p_return is not None:
         highlight_span(ax0, fit.onset, fit.ret)
     ax0.plot(full, disp.reindex(full).to_numpy(), lw=0.75, color=RULE, zorder=3)
     ax0.set_yscale("log")
-    ax0.set_ylabel("MAD (pips)")
+    ax0.set_ylabel("dispersion, relative to\nthe same hour on a typical day")
     ax0.set_title("Hourly dispersion of the basis, diurnal profile removed")
+    ax0.annotate("1.0 is the typical level for that time of day; the profile "
+                 "swings 4x across the day and has been divided out",
+                 xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
+                 color="#666666", va="bottom", ha="left")
     ax0.xaxis.set_major_locator(mdates.DayLocator(interval=7))
     ax0.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     annotate_event(ax0, BOJ_SHOCK, "BOJ")
@@ -769,7 +1231,7 @@ def main():
     open_rows = ~roll.to_numpy()
     for k, name in enumerate(names):
         u, p = survival(d["basis"].to_numpy()[(labels == k) & open_rows])
-        ax[0].loglog(u, p, lw=1.8, color=REGIME_COLOUR[k], label=name,
+        ax[0].loglog(u, p, lw=1.8, color=regime_colours(len(names))[k], label=name,
                      solid_capstyle="round")
     ax[0].set_xlabel("threshold $u$ (pips)")
     ax[0].set_ylabel(r"$P\,(\,|\mathrm{basis}| > u\,)$")
@@ -785,7 +1247,7 @@ def main():
     for k, name in enumerate(names):
         sel = bucket_lab == k
         ax[1].scatter(feat["roll_c"].to_numpy()[sel], feat["mad"].to_numpy()[sel],
-                      s=16, c=REGIME_COLOUR[k], alpha=0.75, lw=0.3,
+                      s=16, c=regime_colours(len(names))[k], alpha=0.75, lw=0.3,
                       edgecolor="white", label=name)
     lim = np.array([np.nanmin(feat["roll_c"]) * 0.8, np.nanmax(feat["mad"]) * 1.2])
     ax[1].plot(lim, lim, color=MUTE, lw=0.8, ls=":", zorder=0)
