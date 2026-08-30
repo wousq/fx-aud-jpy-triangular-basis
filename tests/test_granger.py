@@ -73,7 +73,7 @@ def tree(tmp_path_factory):
 
     sys.path.insert(0, str(root / "scripts"))
     gen = _load(root / "scripts" / "make_synthetic.py", "make_synthetic")
-    g = _load(root / "scripts" / "04_granger.py", "granger04")
+    g = _load(root / "scripts" / "04_granger_causality.py", "granger04")
 
     # Trimmed so the suite runs in a minute rather than ten. Two placebo
     # offsets still give the maximum something to be a maximum of, and the lag
