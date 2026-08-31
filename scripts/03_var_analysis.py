@@ -1,5 +1,5 @@
 """
-03_var.py
+03_var_analysis.py
 
 Does the triangle still close under stress, how fast, and which leg does the
 closing?
