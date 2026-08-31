@@ -8,7 +8,16 @@ Layout
     data/raw/dukascopy/   {PAIR}_1Tick_{BID,ASK}_*.csv    gap repair
     data/processed/synchronized_rates.parquet             output
 
-Three things distinguish this from a plain LOCF pipeline.
+Four things distinguish this from a plain LOCF pipeline.
+
+Quotes, not just mids. Both vendors publish bid and ask; collapsing them to
+a mid at parse time discards the only measurement of what a trade costs,
+and with it any ability to ask whether an observed dislocation was
+executable. Bid and ask are carried through the grid alongside the mid.
+They are taken from one tick, never assembled from two: ARG_MAX over a
+common ordering key returns the same row's values, and the two columns are
+null in identical rows so the forward fill cannot pair a bid from one
+second with an ask from another. Section 05 depends on that pairing.
 
 Gap repair. The HistData USD/JPY export is missing four hours on 5 August
 2024 (12:00-14:00, 16:00-17:00 and 18:00-19:00 local), which contain the
@@ -60,8 +69,13 @@ DUKA_UTC_OFFSET = pd.Timedelta(hours=-4)
 
 def load_dukascopy(pair: str, directory: Path = DUKA_DIR):
     """
-    Read Dukascopy BID/ASK tick exports for one pair and return one mid per
-    second, expressed in HistData's clock.
+    Read Dukascopy BID/ASK tick exports for one pair and return one quote
+    per second, expressed in HistData's clock.
+
+    Bid, ask and mid are all taken with .last() over the same grouping, so
+    the three come from one tick. Aggregating them separately would be the
+    same code and a different meaning: a mid built from the last bid and
+    the last ask of a second is not a quote that ever stood.
 
     Timestamps in these files carry second resolution with many ticks per
     second, so the last tick of a second is identified by file order.
@@ -100,7 +114,9 @@ def load_dukascopy(pair: str, directory: Path = DUKA_DIR):
     tick["mid"] = (tick.bid + tick.ask) / 2.0
 
     sec = (tick.assign(sec_time=tick.tick_time.dt.floor("s"))
-               .groupby("sec_time", sort=True)["mid"].last()
+               .groupby("sec_time", sort=True)
+               .agg(bid=("bid", "last"), ask=("ask", "last"),
+                    mid=("mid", "last"))
                .reset_index())
     print(f"    {pair}: {len(tick):,} ticks / {len(files)} files "
           f"-> {len(sec):,} seconds "
@@ -144,6 +160,8 @@ def build_pipeline() -> None:
         con.execute(f"""
             CREATE TABLE raw_{pair.lower()} AS
             SELECT strptime(column0, '%Y%m%d %H%M%S%g')::TIMESTAMP AS tick_time,
+                   column1::DOUBLE AS bid,
+                   column2::DOUBLE AS ask,
                    (column1::DOUBLE + column2::DOUBLE) / 2.0 AS mid
             FROM read_csv_auto('{pattern}', header=False)
             WHERE column1 IS NOT NULL AND column2 IS NOT NULL
@@ -154,9 +172,15 @@ def build_pipeline() -> None:
 
     print("Downsampling to 1-second buckets (last tick of each second)...")
     for pair in PAIRS:
+        # Three ARG_MAX calls over one ordering key resolve to the same
+        # winning row, so bid, ask and mid describe a single quote. MAX(ask)
+        # with MIN(bid) would look like a tighter aggregate and would be a
+        # spread no participant was ever shown.
         con.execute(f"""
             CREATE TABLE sec_{pair.lower()} AS
             SELECT date_trunc('second', tick_time) AS sec_time,
+                   ARG_MAX(bid, tick_time) AS bid,
+                   ARG_MAX(ask, tick_time) AS ask,
                    ARG_MAX(mid, tick_time) AS mid
             FROM raw_{pair.lower()}
             GROUP BY 1;
@@ -169,11 +193,13 @@ def build_pipeline() -> None:
         sec = load_dukascopy(pair)
         tbl = f"sec_{pair.lower()}_duka"
         if sec is None:
-            con.execute(f"CREATE TABLE {tbl}(sec_time TIMESTAMP, mid DOUBLE);")
+            con.execute(f"CREATE TABLE {tbl}(sec_time TIMESTAMP, bid DOUBLE, "
+                        f"ask DOUBLE, mid DOUBLE);")
             continue
         con.register(f"duka_{pair.lower()}_df", sec)
         con.execute(f"CREATE TABLE {tbl} AS "
-                    f"SELECT sec_time, mid FROM duka_{pair.lower()}_df;")
+                    f"SELECT sec_time, bid, ask, mid "
+                    f"FROM duka_{pair.lower()}_df;")
         n_new = con.execute(f"""
             SELECT COUNT(*) FROM {tbl} d
             WHERE NOT EXISTS (SELECT 1 FROM sec_{pair.lower()} h
@@ -208,10 +234,19 @@ def build_pipeline() -> None:
         SELECT
             g.grid_time,
             -- HistData wins wherever it has a tick; Dukascopy fills only
-            -- the seconds HistData never delivered.
+            -- the seconds HistData never delivered. Within one source the
+            -- three columns are null together, because they come from one
+            -- row, so no COALESCE below can select a bid and an ask from
+            -- different feeds or different seconds.
             COALESCE(a.mid, da.mid) AS raw_audusd,
             COALESCE(u.mid, du.mid) AS raw_usdjpy,
             COALESCE(j.mid, dj.mid) AS raw_audjpy,
+            COALESCE(a.bid, da.bid) AS raw_audusd_bid,
+            COALESCE(a.ask, da.ask) AS raw_audusd_ask,
+            COALESCE(u.bid, du.bid) AS raw_usdjpy_bid,
+            COALESCE(u.ask, du.ask) AS raw_usdjpy_ask,
+            COALESCE(j.bid, dj.bid) AS raw_audjpy_bid,
+            COALESCE(j.ask, dj.ask) AS raw_audjpy_ask,
             CASE WHEN a.mid IS NOT NULL THEN 'histdata'
                  WHEN da.mid IS NOT NULL THEN 'dukascopy' END AS src_audusd,
             CASE WHEN u.mid IS NOT NULL THEN 'histdata'
@@ -235,6 +270,12 @@ def build_pipeline() -> None:
             LAST_VALUE(raw_audusd IGNORE NULLS) OVER w AS audusd_mid,
             LAST_VALUE(raw_usdjpy IGNORE NULLS) OVER w AS usdjpy_mid,
             LAST_VALUE(raw_audjpy IGNORE NULLS) OVER w AS audjpy_direct,
+            LAST_VALUE(raw_audusd_bid IGNORE NULLS) OVER w AS audusd_bid,
+            LAST_VALUE(raw_audusd_ask IGNORE NULLS) OVER w AS audusd_ask,
+            LAST_VALUE(raw_usdjpy_bid IGNORE NULLS) OVER w AS usdjpy_bid,
+            LAST_VALUE(raw_usdjpy_ask IGNORE NULLS) OVER w AS usdjpy_ask,
+            LAST_VALUE(raw_audjpy_bid IGNORE NULLS) OVER w AS audjpy_bid,
+            LAST_VALUE(raw_audjpy_ask IGNORE NULLS) OVER w AS audjpy_ask,
             LAST_VALUE(src_audusd IGNORE NULLS) OVER w AS audusd_source,
             LAST_VALUE(src_usdjpy IGNORE NULLS) OVER w AS usdjpy_source,
             LAST_VALUE(src_audjpy IGNORE NULLS) OVER w AS audjpy_source
@@ -249,6 +290,9 @@ def build_pipeline() -> None:
         audjpy_direct,
         audusd_mid * usdjpy_mid AS audjpy_synthetic,
         audjpy_direct - (audusd_mid * usdjpy_mid) AS spread_dislocation,
+        audusd_bid, audusd_ask,
+        usdjpy_bid, usdjpy_ask,
+        audjpy_bid, audjpy_ask,
         audusd_fresh, usdjpy_fresh, audjpy_fresh,
         audusd_source, usdjpy_source, audjpy_source
     FROM filled
@@ -256,6 +300,23 @@ def build_pipeline() -> None:
       AND usdjpy_mid IS NOT NULL
       AND audjpy_direct IS NOT NULL;
     """)
+
+    # A quote that survived the tick filter can still arrive crossed on the
+    # grid if the splice ever paired columns from different rows. It cannot,
+    # by the argument in the docstring, so this is an assertion rather than
+    # a cleaning step: it should print zero, and a non-zero count means the
+    # pairing invariant 05 relies on has been broken upstream.
+    crossed = con.execute("""
+        SELECT COUNT(*) FROM synchronized_data
+        WHERE audusd_bid >= audusd_ask
+           OR usdjpy_bid >= usdjpy_ask
+           OR audjpy_bid >= audjpy_ask
+    """).fetchone()[0]
+    if crossed:
+        raise ValueError(
+            f"{crossed:,} grid seconds carry a crossed or locked quote after "
+            f"the splice. Bid and ask are no longer paired from one tick; "
+            f"do not run 05 on this file.")
 
     # ---------------------------------------------- validation
     print("\nSource composition:")
@@ -280,6 +341,29 @@ def build_pipeline() -> None:
         FROM synchronized_data GROUP BY 1 ORDER BY 2 DESC
     """).df().to_string(index=False))
     print("  comparable magnitudes across sources indicate a clean splice")
+
+    # Quoted spreads, in each pair's own pips. Printed here so a vendor
+    # change or a column swap shows up at ingest rather than as an
+    # implausible no-arbitrage band three scripts later. These are retail
+    # aggregator quotes and are wider than interdealer; 05 says so where it
+    # matters.
+    print("\nQuoted spread by leg (own pips, open-market seconds):")
+    print(con.execute("""
+        SELECT 'AUD/USD' AS pair,
+               ROUND(MEDIAN(audusd_ask - audusd_bid) * 1e4, 3) AS median,
+               ROUND(QUANTILE_CONT(audusd_ask - audusd_bid, 0.99) * 1e4, 3) AS p99
+        FROM synchronized_data WHERE audusd_fresh
+        UNION ALL
+        SELECT 'USD/JPY',
+               ROUND(MEDIAN(usdjpy_ask - usdjpy_bid) * 1e2, 3),
+               ROUND(QUANTILE_CONT(usdjpy_ask - usdjpy_bid, 0.99) * 1e2, 3)
+        FROM synchronized_data WHERE usdjpy_fresh
+        UNION ALL
+        SELECT 'AUD/JPY',
+               ROUND(MEDIAN(audjpy_ask - audjpy_bid) * 1e2, 3),
+               ROUND(QUANTILE_CONT(audjpy_ask - audjpy_bid, 0.99) * 1e2, 3)
+        FROM synchronized_data WHERE audjpy_fresh
+    """).df().to_string(index=False))
 
     # Residual gaps. A stretch where a leg is silent and the replacement
     # source is silent too is a thin market, not a vendor defect: both
@@ -317,3 +401,4 @@ def build_pipeline() -> None:
 
 if __name__ == "__main__":
     build_pipeline()
+    
