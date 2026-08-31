@@ -1,5 +1,5 @@
 """
-02_changepoint.py
+02_changepoint_detection.py
 
 When did the AUD/JPY triangular basis change structure, and did it change
 back?

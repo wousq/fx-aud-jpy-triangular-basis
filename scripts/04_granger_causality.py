@@ -1,122 +1,99 @@
 """
-04_granger.py
+04_granger_causality.py
 
 Which leg breaks the triangle, and which leg repairs it?
-
-Section 03 asked how fast the triangle closed. It answered with lambda, the
-combination of the three adjustment coefficients, and it was careful to say
-that the *split* of that closure across legs is the least precise thing in the
-script. This one takes up the question the project set out with - "which pair
-breaks the triangle" - and answers it three ways that share no machinery, in
-increasing order of how much has to be assumed.
-
-    1. An identity.  The basis is z = x_AUDJPY - x_AUDUSD - x_USDJPY, so the
-       change in the basis over any window is exactly the sum of the three
-       legs' contributions. For every episode section 01 detected, this script
-       splits the opening and the closing of that episode across the three
-       legs by arithmetic. No lag order, no regression, no regime label enters
-       the calculation. This is the model-free answer and it is the one the
-       report should lead with, for the same reason 03 leads with the episode
-       ruler rather than with its own fit.
-
-    2. A correlation.  The cross-correlation between each leg's increments and
-       the basis's, at leads and lags out to a minute, computed only on pairs
-       that sit inside one unbroken run. A leg that *leads* the basis shows
-       correlation where its own past sits against the basis's future. Still
-       no lag order and no fitted model, only a choice of horizon.
-
-    3. A test.  Block Granger causality inside the error-correction model 03
-       fitted: does the recent history of leg i help predict the next second
-       of the basis, or of another leg, given everything else in the system.
-       This is the formal version, and it is reported last because it has the
-       most machinery between the data and the number.
-
-Two different questions, kept apart
-    "Who breaks it" and "who gives way" are not the same question, and the
-    price-discovery literature conflates them often enough that it is worth
-    separating them explicitly.
-
-        Transitory causality (Gamma).  Does leg i's recent history predict the
-        next move? This is Granger causality in the ordinary sense and it is
-        about the order in which information arrives.
-
-        Error-correction causality (alpha).  Does leg j respond to the level
+ 
+Section 03 measured how fast the triangle closed and warned that the split
+of that closure across legs was its least precise number. This script
+answers the split three ways that share no machinery, in increasing order of
+how much each assumes.
+ 
+    1. An identity. The basis is z = x_AUDJPY - x_AUDUSD - x_USDJPY, so its
+       change over any window is exactly the sum of the three legs'
+       contributions. For every episode section 01 detected, this splits the
+       opening and the closing across the three legs by arithmetic. No
+       model, no lag order. This is the answer the report should lead with,
+       the same way 03 leads with the episode ruler rather than its own fit.
+ 
+    2. A correlation. The cross-correlation between each leg's increments
+       and the basis's, at leads and lags out to a minute, computed only on
+       pairs inside one unbroken run. A leg that leads the basis shows
+       correlation where its own past sits against the basis's future.
+ 
+    3. A test. Block Granger causality inside the error-correction model 03
+       fitted: does leg i's recent history predict the next second of the
+       basis, or of another leg, given everything else in the system.
+       Reported last because it carries the most machinery between the data
+       and the number.
+ 
+Two questions, kept apart
+    Who breaks it and who gives way are not the same question, and the
+    price-discovery literature conflates them often enough to separate
+    explicitly.
+ 
+        Transitory causality (Gamma). Does leg i's recent history predict
+        the next move? Granger causality in the ordinary sense: the order
+        information arrives in.
+ 
+        Error-correction causality (alpha). Does leg j respond to the level
         of the disequilibrium at all? A leg whose alpha is zero is weakly
-        exogenous: it walks away and lets the others come to it, which is what
-        carrying the permanent information looks like. 03 estimated these
-        coefficients; this script tests them.
-
-A degeneracy in the basis equation, and what is done about it
+        exogenous: it walks away and lets the others come to it, which is
+        what carrying the permanent information looks like. 03 estimated
+        these coefficients; this script tests them.
+ 
+A degeneracy in the basis equation
     The basis is a fixed combination of the three legs, so at every lag the
     three legs' increments together span the basis's own lagged increment.
-    Dropping any one leg's block therefore removes part of the basis's own
-    autoregression as well as that leg's information. When the basis is
-    persistent - which under stress it is - all three blocks then test large
-    for that reason alone, and the test cannot rank the legs even though each
-    individual test is well posed.
-
-    So the headline test conditions on the basis's own history explicitly. For
-    each leg it fits a smaller model - the level of the basis, the basis's own
-    lagged increments, and that one leg's lagged increments - and asks what
-    the leg adds beyond the basis's own memory. That is the classical pairwise
-    Granger setup and it isolates the leg. The full-system figure is reported
-    beside it as a control, so the gap between the two can be read rather than
-    argued about.
-
+    Dropping any one leg's block removes part of the basis's own
+    autoregression along with that leg's information, and when the basis is
+    persistent all three blocks then test large for that reason alone. The
+    headline test therefore conditions on the basis's own history
+    explicitly: for each leg it fits a smaller model, the level of the
+    basis, the basis's own lagged increments, and that one leg's lagged
+    increments, and asks what the leg adds beyond the basis's own memory.
+    The full-system figure is reported beside it as a control.
+ 
     Neither model is refitted from the data. Both are column subsets of one
-    extended design whose cross-products are accumulated once, so every number
-    in this script comes from the same rows and the same single pass.
-
-Why there are no Hasbrouck or Gonzalo-Granger information shares here
-    Those measures are defined for two prices of one asset: two series, one
-    cointegrating vector, one common trend, and the trend's loadings then
-    split into shares that sum to one. This system has three prices and one
-    cointegrating restriction, so it has *two* common trends - an AUD trend
-    and a JPY trend - and the orthogonal complement of alpha is 3x2 rather
-    than a vector. There is no scalar share per leg without imposing a
-    normalisation the data does not identify. Reporting one would be a number
-    a reader could not trace, which is the one thing this project's
-    conventions forbid. The weak-exogeneity tests below are the part of that
-    apparatus this system does support, and they are reported instead.
-
+    extended design whose cross-products are accumulated once.
+ 
+Why there are no Hasbrouck or Gonzalo-Granger information shares
+    Those measures are defined for two prices of one asset: one
+    cointegrating vector, one common trend, and the trend's loadings split
+    into shares that sum to one. This system has three prices and one
+    cointegrating restriction, so it has two common trends, an AUD trend and
+    a JPY trend, and alpha's orthogonal complement is 3x2 rather than a
+    vector. No scalar share per leg is identified without a normalisation
+    the data does not supply. The weak-exogeneity tests below are the part
+    of that apparatus this system does support.
+ 
 Why a p-value is not the evidence here
-    Every test in this script is computed on between one hundred thousand and
-    a million seconds. At that sample size a coefficient of no economic
-    consequence rejects at any conventional level, and a table of p-values
-    reading "< 0.001" throughout says only that n is large. So every test is
-    reported with an effect size next to it - the incremental predictable
-    move, in pips per second, that the block buys - and every effect size is
-    reported next to a *placebo* threshold obtained by giving the same test
-    the same leg's increments from a different day. The placebo keeps each
-    leg's own autocorrelation and its own volatility clustering and destroys
-    only the cross-leg timing, so it is the distribution of the statistic when
-    the null is true and everything else is as it really is. Without it there
-    is no way to know what "found nothing" would look like.
-
-Which seconds are used, and where that rule comes from
-    A lag window must be contiguous in clock time, outside the daily rollover
-    break, inside one regime and one trading day, and confidently labelled by
-    the regime posterior. Those rules belong to the error-correction model
-    this script tests, and they are imported from 03_var.py rather than
-    reimplemented: a Granger test computed on a different set of seconds than
-    the model it comments on is not a test of that model, and one definition
-    of the guard that stops this pipeline differencing a price across a
-    weekend is enough.
-
-    Only that module is needed, not its outputs. This script reads the cleaned
-    price file and the regime labels and requires nothing else. Where the
-    error-correction model has already been fitted, its selected lag order is
-    read and reused so that both describe one specification; where it has not,
-    the same criterion on the same grid selects one here and the script says
-    which happened.
-
+    Every test here runs on between one hundred thousand and a million
+    seconds. At that size a coefficient of no economic consequence rejects
+    at any conventional level. So every test carries an effect size, the
+    incremental predictable move in pips per second, next to a placebo
+    threshold from the same test with that leg's increments taken from a
+    different day. The placebo keeps a leg's own autocorrelation and
+    volatility clustering and destroys only the cross-leg timing: it is the
+    distribution of the statistic when the null is true and everything else
+    is as it really is.
+ 
+Which seconds are used
+    A lag window must be contiguous in clock time, outside the daily
+    rollover break, inside one regime and one trading day, and confidently
+    labelled by the regime posterior. Those rules belong to the
+    error-correction model this script tests and are imported from
+    03_var.py rather than reimplemented.
+ 
+    Only that module is needed, not its outputs. This script reads the
+    cleaned price file and the regime labels and requires nothing else.
+    Where the error-correction model has already been fitted, its selected
+    lag order is read and reused; where it has not, the same criterion on
+    the same grid selects one here.
+ 
 Outputs
-
-    Seven tables. Each is written twice, as output/tables/<name>.csv for
-    reading and as report/tables/<name>.tex for the report to input, and each
-    is also printed to the run log, so the log alone is a complete record of
-    what this script found.
-
+    Seven tables, each written as output/tables/<name>.csv and
+    report/tables/<name>.tex, and printed to the run log:
+ 
         04_attribution        which leg opened each dislocation and which
                               closed it, by arithmetic
         04_basis_causality    headline: what each leg's history says about
@@ -126,13 +103,13 @@ Outputs
         04_lead_lag           cross-correlations at matched leads and lags
         04_null_calibration   what the tests return when the null is true
         04_sensitivity        the headline under every convention varied
-
-    Three figures, in output/figures/: 04_attribution.png, 04_lead_lag.png,
+ 
+    Three figures in output/figures/: 04_attribution.png, 04_lead_lag.png,
     04_granger.png.
-
-    One dataset, output/data/04_granger_tests.parquet: every test in this
-    script with its statistic, effect size and provenance, so the tables above
-    can be rebuilt without refitting anything.
+ 
+    One dataset, output/data/04_granger_tests.parquet: every test with its
+    statistic, effect size and provenance, so the tables above can be
+    rebuilt without refitting anything.
 """
 
 from __future__ import annotations
