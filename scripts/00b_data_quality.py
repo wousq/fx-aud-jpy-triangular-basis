@@ -11,40 +11,70 @@ then silently substitutes a stale price, which is correct when a quote is
 late and wrong when a feed is dead. Nothing in the filled series
 distinguishes the two cases.
 
-These four checks close that gap.
+These five checks close that gap.
 
   1. Grid continuity    the second grid has no holes
   2. Coverage           each leg prints often enough, per day
   3. Single-leg outage  no leg goes silent while the others quote
   4. Reconciliation     each leg agrees with the value implied by the
-                        other two
+                        other two, in the tail
+  5. Bias               and agrees on average, day by day
 
-Check 4 is the informative one. In an over-identified price system the
-redundancy that creates the arbitrage relationship also creates a
-validation instrument: USD/JPY implied by AUD/JPY divided by AUD/USD must
-agree with quoted USD/JPY if all three legs are sound. A frozen leg fails
-this immediately, and no threshold tuning is required to see it.
+Checks 4 and 5 both use the over-identification: USD/JPY implied by
+AUD/JPY divided by AUD/USD must agree with quoted USD/JPY if all three
+legs are sound. They are separate checks because they detect different
+failures, and neither sees the other's.
+
+    Check 4 takes the 99.9th percentile of the *absolute* gap. That is a
+    tail statistic, and it catches a frozen or wildly wrong leg.
+
+    Check 5 takes the *median signed* gap within each day. A leg biased by
+    a fraction of a pip moves this immediately and does not move check 4
+    at all, because the tail is set by ordinary noise an order of
+    magnitude larger. A persistent bias is the more dangerous of the two
+    failures: everything downstream still looks plausible, and any
+    analysis that measures dispersion, takes differences, or centres per
+    day removes it before anyone sees it.
+
+Closures are excluded from both. The FX week ends 17:00 Friday and reopens
+17:00 Sunday. Across that stretch the grid is forward-filled padding, so
+every second carries the same frozen quote and therefore the same frozen
+gap. One weekend is roughly 172,000 identical values, over one percent of
+a two-month sample, which is enough to occupy the upper percentiles of
+anything computed on the full grid. Before this was fixed, check 4's p99
+and p99.9 were bit-identical for all three legs and both equal to a single
+stale weekend value: the check was reporting a property of the padding.
+
+closed_mask is imported rather than reimplemented, so the rows this gate
+inspects are the rows 01 goes on to analyse.
 """
 
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "data" / "processed" / "synchronized_rates.parquet"
-TAB_DIR = ROOT / "output" / "tables"
+from utils import closed_mask, load_data, DATA_PATH, LEGACY_DATA_PATH, TAB_DIR
 
 PAIRS = ["audusd_mid", "usdjpy_mid", "audjpy_direct"]
 LABEL = {"audusd_mid": "AUD/USD", "usdjpy_mid": "USD/JPY",
          "audjpy_direct": "AUD/JPY"}
+PIP = {"audusd_mid": 1e-4, "usdjpy_mid": 1e-2, "audjpy_direct": 1e-2}
 
 MAX_STALE_SECONDS = 600      # a leg silent this long while others quote
 MIN_DAILY_COVERAGE = 0.05    # fraction of seconds with a fresh tick
 MAX_RECON_GAP_PIPS = 25.0    # implied vs quoted, 99.9th percentile
+CLOSURE_MIN_RUN = 600        # matches 01; a run this long is not a market
+
+# A day whose median signed gap exceeds this is carrying a bias rather than
+# noise. Clean days in this sample sit under 0.05 pips, so the threshold is
+# about twice the noise floor. It is deliberately not loose: the failure it
+# exists to catch was a shade under one AUD/USD pip and survived a 25-pip
+# tail threshold for two full trading days.
+MAX_DAILY_BIAS_PIPS = 0.10
+MIN_SECONDS_FOR_BIAS = 3600  # a day thinner than this cannot support a median
 
 failures: list[str] = []
 warnings: list[str] = []
@@ -73,13 +103,21 @@ def freshness(df: pd.DataFrame, col: str) -> pd.Series:
     return df[col].diff().ne(0)
 
 
+def implied(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """Each leg as the other two imply it."""
+    return {
+        "usdjpy_mid": df["audjpy_direct"] / df["audusd_mid"],
+        "audusd_mid": df["audjpy_direct"] / df["usdjpy_mid"],
+        "audjpy_direct": df["audusd_mid"] * df["usdjpy_mid"],
+    }
+
+
 def main() -> int:
-    if not DATA.exists():
-        print(f"missing {DATA} — run 00_ingest_and_sync.py first")
+    if not DATA_PATH.exists() and not LEGACY_DATA_PATH.exists():
+        print(f"missing {DATA_PATH} — run 00_ingest_and_sync.py first")
         return 2
 
-    df = pd.read_parquet(DATA).rename(columns={"grid_time": "t"})
-    df = df.set_index("t").sort_index()
+    df = load_data()
     print(f"{len(df):,} rows, {df.index[0]} to {df.index[-1]}\n")
 
     # ---------------------------------------------- 1. grid continuity
@@ -120,29 +158,68 @@ def main() -> int:
         check(f"{LABEL[c]} never isolated", n == 0, detail)
     outages = pd.DataFrame(rows)
 
-    # ---------------------------------------------- 4. reconciliation
-    print("\n4. Triangular reconciliation")
-    implied = {
-        "usdjpy_mid": df["audjpy_direct"] / df["audusd_mid"],
-        "audusd_mid": df["audjpy_direct"] / df["usdjpy_mid"],
-        "audjpy_direct": df["audusd_mid"] * df["usdjpy_mid"],
-    }
+    # ---------------------------------------------- open-market rows
+    # Everything below is computed on these. A gap measured on padding is a
+    # property of the last quote before the close, repeated.
+    closed = closed_mask(df, cols=PAIRS, min_run=CLOSURE_MIN_RUN)
+    live = df.loc[~closed]
+    print(f"\nExcluding {closed.mean():.1%} of rows as market closure; "
+          f"{len(live):,} open-market seconds remain")
+
+    imp = implied(live)
+    gaps = pd.DataFrame({c: (imp[c] - live[c]) / PIP[c] for c in PAIRS},
+                        index=live.index)
+
+    # ---------------------------------------------- 4. reconciliation, tail
+    print("\n4. Triangular reconciliation — dispersion")
     recon = []
     for c in PAIRS:
-        pip = 1e-4 if c == "audusd_mid" else 1e-2
-        gap = (implied[c] - df[c]).abs() / pip
-        p999 = float(gap.quantile(0.999))
-        recon.append({"pair": LABEL[c], "median_gap_pips": float(gap.median()),
-                      "p99_gap_pips": float(gap.quantile(0.99)),
-                      "p999_gap_pips": p999, "max_gap_pips": float(gap.max())})
+        g = gaps[c].abs()
+        p999 = float(g.quantile(0.999))
+        recon.append({"pair": LABEL[c], "median_gap_pips": float(g.median()),
+                      "p99_gap_pips": float(g.quantile(0.99)),
+                      "p999_gap_pips": p999, "max_gap_pips": float(g.max())})
         check(f"{LABEL[c]} agrees with its implied value",
               p999 <= MAX_RECON_GAP_PIPS,
               f"99.9th percentile gap {p999:.2f} pips")
     recon = pd.DataFrame(recon)
 
-    # ---------------------------------------------- provenance
+    # ---------------------------------------------- 5. reconciliation, bias
+    print("\n5. Triangular reconciliation — daily bias")
+    names = [LABEL[c] for c in PAIRS]
+    lday = live.index.floor("D")
+    bias = gaps.groupby(lday).median()
+    bias.columns = names
+    bias["seconds"] = gaps.groupby(lday).size()
+    bias = bias[bias["seconds"] >= MIN_SECONDS_FOR_BIAS]
+
+    for pair in names:
+        offenders = bias.index[bias[pair].abs() > MAX_DAILY_BIAS_PIPS]
+        detail = f"largest daily median {bias[pair].abs().max():.3f} pips"
+        if len(offenders):
+            span = (f"{offenders[0]:%d %b}" if len(offenders) == 1
+                    else f"{offenders[0]:%d %b} to {offenders[-1]:%d %b}")
+            detail += f"; {len(offenders)} day(s), {span}"
+        check(f"{pair} unbiased day to day", not len(offenders), detail)
+
+    flagged = bias[(bias[names].abs() > MAX_DAILY_BIAS_PIPS).any(axis=1)]
+    if len(flagged):
+        print("\n  days carrying a bias (median signed gap, each leg's own "
+              "pips):")
+        for line in flagged.to_string(
+                float_format=lambda v: f"{v:+.3f}").split("\n"):
+            print(f"    {line}")
+        print("\n  The triangle cannot say which leg is at fault: these "
+              "three columns are")
+        print("  one discrepancy written three ways, and any of the three "
+              "reproduces it")
+        print("  exactly. Identifying the leg needs a source outside the "
+              "triangle, so")
+        print("  compare each leg against Dukascopy over the flagged days.")
+
+    # ---------------------------------------------- 6. provenance
     if "usdjpy_source" in df.columns:
-        print("\n5. Source provenance")
+        print("\n6. Source provenance")
         for c in ["audusd_source", "usdjpy_source", "audjpy_source"]:
             if c in df.columns:
                 vc = df[c].value_counts()
@@ -154,8 +231,9 @@ def main() -> int:
     outages.to_csv(TAB_DIR / "00_outages.csv", index=False)
     recon.to_csv(TAB_DIR / "00_reconciliation.csv", index=False)
     cov.to_csv(TAB_DIR / "00_coverage.csv")
-    print(f"\nwrote 00_outages.csv, 00_reconciliation.csv, 00_coverage.csv "
-          f"to {TAB_DIR}")
+    bias.to_csv(TAB_DIR / "00_daily_bias.csv")
+    print(f"\nwrote 00_outages.csv, 00_reconciliation.csv, 00_coverage.csv, "
+          f"00_daily_bias.csv to {TAB_DIR}")
 
     if warnings:
         print(f"\n{len(warnings)} warning(s):")
