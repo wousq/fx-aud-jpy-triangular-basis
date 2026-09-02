@@ -1,14 +1,21 @@
-# ---- data: large, redistributable only from the vendor ----
+# ---- vendor data: large, and redistributable only from the vendor ----
 data/raw/**
-data/*.parquet
+!data/raw/.gitkeep
+
+data/**/*.parquet
 !data/README.md
 
-# ---- generated output: reproducible via `make all` ----
-output/**
-!output/.gitkeep
-!output/figures/.gitkeep
-!output/tables/.gitkeep
+# ---- generated output ----
+#
+# Tables and figures ARE committed. The README cites them by name, and a
+# reader who never runs the pipeline should still be able to open them.
+# 212 KB across 46 tables and 1.5 MB across 15 figures.
+#
+output/data/*
 !output/data/.gitkeep
+
+# The data-quality stamp the Makefile writes.
+output/.quality-ok
 
 # ---- latex build artefacts ----
 report/**/*.aux
@@ -20,7 +27,8 @@ report/**/*.fls
 report/**/*.fdb_latexmk
 report/**/*.synctex.gz
 report/**/*.toc
-report/main.pdf
+
+# report/main.pdf is deliberately NOT ignored
 
 # ---- python ----
 __pycache__/
