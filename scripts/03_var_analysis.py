@@ -1699,6 +1699,15 @@ def main():
     variants.append(run_variant("rollover seconds included", ok_v=ok_roll,
                                 note="17:00-17:30 back in"))
 
+    # The mirror of the row above. 06 finds nine of the twenty widest
+    # episodes starting in the half hour after the filter reopens, in 2.1%
+    # of the admissible seconds, so the question is not only whether the
+    # excluded window is bad but whether it ends too early.
+    roll_wide = in_rollover(d.index, end="18:00").to_numpy()
+    variants.append(run_variant(
+        "rollover excluded to 18:00", ok_v=(~roll_wide) & (pmax >= P_MIN),
+        note="the half hour after the filter reopens removed as well"))
+
     # The specification this replaced, kept because the gap between this row
     # and the baseline is the whole reason for the daily centring.
     variants.append(run_variant(
