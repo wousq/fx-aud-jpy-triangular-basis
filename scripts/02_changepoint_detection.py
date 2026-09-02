@@ -853,6 +853,16 @@ def main():
     # ------------------------------------------------ tables
     print("tables")
     stats = regime_summary(d, roll, labels, names, episodes)
+    # Same contrast under the wider exclusion, printed rather than saved:
+    # it is a robustness check on three rows, not a second version of the
+    # table. Only the rows that do not depend on the episode set are shown,
+    # because `episodes` was detected against the 17:30 boundary and its
+    # counts would not be comparable here.
+    stats_wide = regime_summary(d, in_rollover(d.index, end="18:00"),
+                                labels, names, episodes)
+    print(" rollover excluded to 18:00, for comparison:")
+    print(stats_wide.loc[["basis MAD (pips)", "AR(1) rho of level",
+                          "half-life (s)"]].to_string())
     save_table(
         stats, "02_regime_stats",
         caption=("The basis by estimated regime, open-market seconds outside "
@@ -985,6 +995,17 @@ def main():
     y_nr = deseason(y_raw, reopen_buckets=0)[0]
     rows.append(variant_row("no session-reopen adjustment",
                             fit_changepoint(y_nr, min_seg), y_nr))
+
+    # The rollover window is excluded because liquidity collapses and the
+    # synthetic leg goes stale. 06 finds that condition does not stop at
+    # 17:30: nine of the twenty widest episodes start in the half hour after
+    # the filter reopens, in 2.1% of the admissible seconds. This asks
+    # whether the dates and the ratio depend on where that edge is put.
+    roll_wide = in_rollover(d.index, end="18:00")
+    f_wide, _ = bucket_features(d, roll_wide, BUCKET)
+    y_wide = deseason(np.log(f_wide["mad"]))[0]
+    rows.append(variant_row("rollover excluded to 18:00",
+                            fit_changepoint(y_wide, min_seg), y_wide))
     for freq, label in [("30min", "30-minute buckets"), ("2h", "2-hour buckets")]:
         f2, _ = bucket_features(d, roll, freq)
         y2 = deseason(np.log(f2["mad"]), freq)[0]
