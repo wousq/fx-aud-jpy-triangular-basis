@@ -1,15 +1,4 @@
-# Normalise line endings: LF in the repository, native on checkout.
-* text=auto eol=lf
-
-# Text files that must stay LF
-*.py     text eol=lf
-*.csv    text eol=lf
-*.md     text eol=lf
-*.tex    text eol=lf
-*.bib    text eol=lf
-*.yml    text eol=lf
-*.txt    text eol=lf
-Makefile text eol=lf
+* text eol=lf
 
 # Binary — never diff, never touch line endings
 *.parquet binary
