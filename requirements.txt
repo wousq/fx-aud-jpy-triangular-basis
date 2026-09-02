@@ -1,0 +1,44 @@
+# FX Triangular Pricing — Python dependencies
+#
+#   pip install -r requirements.txt
+#
+# Bounds admit the minor series in use and exclude the next major.
+# Derived from the imports of 00, 00b, 01, 02, 03, 04 and utils.
+
+# --- ingest (00)
+duckdb>=1.1,<2.0
+
+# --- core (all scripts)
+pandas>=2.2,<3.0           
+numpy>=1.26,<3.0
+pyarrow>=15.0,<26.0        
+matplotlib>=3.8,<4.0      
+
+# --- estimators (02, 04, and 06 when written)
+scipy>=1.12,<2.0
+
+# --- table output (utils.emit)
+jinja2>=3.1,<4.0         
+
+# --- testing
+pytest>=8.0,<10.0
+
+# --- standard library: installed with the interpreter, NOT listed above.
+#     Naming any of these here would break the install, since several
+#     resolve to unrelated abandoned packages on PyPI.
+#
+#       __future__.annotations   00, 00b, 02, 03, 04
+#       functools.lru_cache      02
+#       glob                     00
+#       importlib.util           04            loads 03 by path
+#       os                       00, 02
+#       pathlib.Path             00, 00b, 04, utils
+#       re                       03, 04
+#       sys                      00b, 04
+#       time                     02
+#       typing.NamedTuple        02, 03
+#       typing.Optional          03
+#
+#     No syntax in the pipeline requires above 3.9. Python 3.11 is the
+#     version the pipeline was run and reported under, and is a
+#     convention, not a language floor.
