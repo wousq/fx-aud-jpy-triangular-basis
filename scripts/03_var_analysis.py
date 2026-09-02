@@ -104,8 +104,7 @@ Estimation notes that matter
     from one scalar series per equation - see `alpha_hac_cov`.
 
 Outputs
-    output/data/03_resid.parquet          per-second VECM residuals, for 06
-    output/data/03_var_model.parquet      coefficients, for 06
+    output/data/03_var_model.parquet      fitted coefficients and lag order
     output/tables/03_error_correction.csv headline: alpha, lambda, half-lives
     output/tables/03_var_fit.csv          fit and residual diagnostics
     output/tables/03_lag_selection.csv    BIC over the lag grid
@@ -131,7 +130,7 @@ import matplotlib.ticker as mticker
 
 from utils import (
     make_dirs, set_style, in_rollover, robust_scale, save_table, save_fig,
-    adjacent, check_grid, annotate_event, highlight_span,
+    adjacent, check_grid, panel_title, annotate_event, highlight_span,
     DAT_DIR, TAB_DIR, TEX_DIR, BOJ_SHOCK, TZ_LABEL,
     GRID_SECONDS, PAIR_LABEL, regime_colours,
     MUTE, RULE, BAND_ALPHA,
@@ -637,8 +636,8 @@ def fit_vecm(name, rows, run, DX, Z, p, cell, light=False, nw=NW_LAGS,
     all the normal equations need, and the residual covariance follows from
     them as Y'Y - B'X'Y without a second pass. `light` stops there and is
     what the sensitivity table, the frequency block and the daily series
-    use; the full path also materialises the residuals, which are needed for
-    the HAC term, the residual autocorrelations and 06.
+    use; the full path also materialises the residuals, which the HAC term
+    and the residual autocorrelations both need.
 
     `cell` decides what the error-correction term is measured against. Pass
     the day for the estimand this project wants, or the regime to reproduce
@@ -988,21 +987,6 @@ def coefficient_frame(fits, names):
 
 # ------------------------------------------------------------------ figures
 
-def panel_title(ax, title, note):
-    """
-    Title with a subtitle underneath it.
-
-    The subtitle sits just above the axes, so the title has to be pushed
-    clear of it. rcParams sets a pad of 10, which is the height of the
-    subtitle itself and therefore exactly enough for the two to overlap;
-    this passes a local pad instead of editing utils, because changing the
-    default there would move the titles in 01 and 02 as well.
-    """
-    ax.set_title(title, pad=19)
-    ax.annotate(note, xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-                color="#666666", va="bottom", ha="left")
-
-
 def figure_error_correction(fits, names, colours, measured=None):
     fig, ax = plt.subplots(1, 2, figsize=(10, 4.4),
                            gridspec_kw={"wspace": 0.26})
@@ -1027,9 +1011,9 @@ def figure_error_correction(fits, names, colours, measured=None):
     ax[0].set_xticks(base)
     ax[0].set_xticklabels([PAIR_LABEL[LEG_SOURCE[c]] for c in LEGS]
                           + [r"$\lambda$"])
-    ax[0].set_ylabel("adjustment per second")
+    ax[0].set_ylabel("loading, α (per second)")
     ax[0].margins(y=0.16)
-    panel_title(ax[0], "How each leg responds to an open triangle",
+    panel_title(ax[0], "Error-correction loadings by leg",
                 "closure needs AUD/JPY negative, the other two positive, "
                 r"and $\lambda$ below zero")
     # Below the axes, not inside them. This panel's data are points with
@@ -1082,9 +1066,9 @@ def figure_error_correction(fits, names, colours, measured=None):
                        color=colours[k], zorder=4)
         ax[1].plot([], [], lw=1.4, ls=(0, (3, 2)), color=RULE,
                    label="measured, episodes")
-    panel_title(ax[1], "How long a dislocation survives",
-                "solid: the fitted system run down with no further shocks. "
-                "dashed: the episodes of 01, measured with a ruler")
+    panel_title(ax[1], "Survival of a dislocation",
+                "solid: fitted decay, no further shocks."
+                "dashed: observed episodes.")
     ax[1].legend(loc="upper right")
     save_fig(fig, "03_error_correction")
 
@@ -1172,9 +1156,9 @@ def figure_closure_speed(daily, fits, names, colours, boundaries):
     ax.set_ylabel("half-life of a dislocation (s)")
     ax.set_xlabel(TZ_LABEL)
     ax.margins(y=0.22)
-    panel_title(ax, "How fast the triangle closed, day by day",
+    panel_title(ax, "Daily half-life of a dislocation",
                 "each day fitted on its own, with no regime label supplied; "
-                "bands are the regimes 02 estimated")
+                "horizontal lines are the estimated regime means")
     ax.xaxis.set_major_locator(mdates.DayLocator(interval=7))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     annotate_event(ax, BOJ_SHOCK, "BOJ")
@@ -1583,9 +1567,9 @@ def main():
     coefs = coefficient_frame(fits, names)
     save_table(
         coefs.drop(columns=["regime_id"]), "03_coefficients", index=False,
-        caption=("Every fitted coefficient, so the impulse responses in 06 "
-                 "can be reconstructed from a file rather than from a rerun. "
-                 "Standard errors are reported only for the "
+        caption=("Every fitted coefficient, so any statement made about this "
+                 "model elsewhere can be checked against a file rather than "
+                 "against a rerun. Standard errors are reported only for the "
                  "error-correction terms, in Table~\\ref{tab:error_correction}: "
                  "the transitory terms are a nuisance and are not "
                  "interpreted."),
@@ -1801,37 +1785,10 @@ def main():
 
     # ----------------------------------------------------------- write
     print("data")
-    frames = []
-    for k, name in enumerate(names):
-        f = fits.get(name)
-        if f is None:
-            continue
-        frame = pd.DataFrame(
-            f.resid.astype(np.float32),
-            index=d.index[f.rows],
-            columns=[f"e_{c.removeprefix('x_')}" for c in LEGS])
-        frame.insert(0, "regime", np.int8(k))
-        # The centred term the fit actually used, so 06 does not have to
-        # reconstruct the day cells to reproduce this regression.
-        frame["z_lag"] = f.zc.astype(np.float32)
-        # A run is a maximal stretch of consecutive seconds inside one
-        # regime. 06 needs it: without it a lagged difference taken on this
-        # file would silently span a weekend, which is the one mistake this
-        # pipeline has already made once.
-        frame["run"] = f.run
-        frames.append(frame)
-
-    resid = pd.concat(frames).sort_index()
-    resid.index.name = "t"
-    # Run ids arrive as positions in the full grid, unique across regimes by
-    # construction. Renumbered to consecutive integers only to keep the file
-    # small; uniqueness is preserved, so the id never has to be read together
-    # with the regime column.
-    resid["run"] = pd.factorize(resid["run"])[0].astype(np.int32)
-    resid.to_parquet(DAT_DIR / "03_resid.parquet")
-    print(f" -> 03_resid.parquet ({len(resid):,} rows, "
-          f"{resid['run'].nunique():,} unbroken runs)")
-
+    # The coefficients, so a statement about this model can be checked
+    # against a file instead of against a rerun. 04 reads its lag order and
+    # its reference coefficients from here rather than refitting, which is
+    # what keeps the two scripts describing the same model.
     coefs.to_parquet(DAT_DIR / "03_var_model.parquet", index=False)
     print(f" -> 03_var_model.parquet ({len(coefs):,} coefficients, "
           f"p = {p_star})")

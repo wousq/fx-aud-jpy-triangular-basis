@@ -1,7 +1,7 @@
 """
 05_execution_bounds.py
 
-Was any of it executable?
+How wide was the bound, and how close did the basis get to it?
 
 Sections 01 to 04 measure the triangle on mid quotes. That is the right
 series for asking how prices adjust, and the wrong one for asking whether a
@@ -75,6 +75,26 @@ Latency
     are dropped rather than differenced across. delta = 0 is retained as
     the unattainable upper bound, not as a result.
 
+Why a positive edge is not an opportunity
+    The grid is one second wide and the three legs are separate feeds. A
+    row records the last print of each leg inside that second, not three
+    prices that stood together at any instant. Triangular arbitrage
+    requires simultaneity across all three, so a positive edge computed
+    from this grid is an upper bound on what was available and not a
+    measurement of it: whenever prices travel far enough inside a second,
+    the three prints are separated by however long the slowest leg went
+    quiet, and that separation alone manufactures an apparent edge.
+
+    Second resolution cannot separate the two readings, and no finer data
+    exists for these pairs from either vendor. The count of positive-edge
+    seconds is therefore reported as a bound and never as a rate of
+    opportunity. 05_edge_velocity.csv conditions that count on how far
+    prices travelled inside the second, which is the signature the two
+    readings differ on: a displacement that was really there does not care
+    how fast the market was moving, and non-simultaneity does. The latency
+    ladder is read the same way, since an opportunity decays as the delay
+    between signal and fill grows and a measurement artefact does not.
+
 Retail quotes, and the haircut
     Both vendors publish aggregator quotes, which are wider than what a
     bank arbitrage desk sees. This biases the exercise toward finding
@@ -85,12 +105,13 @@ Retail quotes, and the haircut
     desk plausibly sees a band that much tighter.
 
 Outputs
-    output/tables/05_execution.csv      band, gap and executability by regime
+    output/tables/05_execution.csv      band, gap and the bound by regime
     output/tables/05_band_vs_gap.csv    the ratio-of-ratios comparison
     output/tables/05_decomposition.csv  the band split across the three legs
     output/tables/05_breakeven.csv      per-episode cost required to clear
+    output/tables/05_edge_velocity.csv  the bound against within-second travel
     output/tables/05_latency.csv        delay x freshness gate
-    output/tables/05_haircut.csv        executability against a spread haircut
+    output/tables/05_haircut.csv        the bound against a spread haircut
     output/tables/05_sensitivity.csv
     output/figures/05_bands.png
     output/figures/05_executable.png
@@ -107,7 +128,7 @@ import matplotlib.dates as mdates
 
 from utils import (
     make_dirs, set_style, load_data, adjacent, check_grid, in_rollover,
-    robust_scale, save_table, save_fig, zero_line, annotate_event,
+    robust_scale, save_table, save_fig, zero_line, panel_title, annotate_event,
     regime_colours, survival,
     PIP, FOUND, RULE, BOJ_SHOCK, DAT_DIR,
     LEG_AUDUSD, LEG_USDJPY, LEG_AUDJPY, TZ_LABEL,
@@ -395,6 +416,10 @@ def executable_counts(d, labels, names, admit, gate, delta, haircut=1.0):
     """
     Seconds on which a complete circuit would have paid, by regime.
 
+    Upper bound, not a count of opportunities: the three legs are recorded
+    at one-second resolution and are not known to have stood together. See
+    the module docstring and 05_edge_velocity.csv.
+
     A haircut scales the band, which is equivalent to scaling every quoted
     spread: edge(k) = z - k * c on the rich side and -z - k * c on the
     cheap side, so the mid basis is held fixed and only the cost moves.
@@ -425,7 +450,7 @@ def executable_counts(d, labels, names, admit, gate, delta, haircut=1.0):
         hit = sel & (edge > 0)
         rows[name] = {
             "eligible seconds": n_sel,
-            "executable seconds": int(hit.sum()),
+            "positive-edge seconds": int(hit.sum()),
             "share": float(hit.sum()) / n_sel if n_sel else np.nan,
             "best edge (pips)": float(edge[sel].max()) if n_sel else np.nan,
             "median shortfall (pips)": float(np.median(-edge[sel]))
@@ -435,29 +460,6 @@ def executable_counts(d, labels, names, admit, gate, delta, haircut=1.0):
 
 
 # ------------------------------------------------------------------ figures
-
-def titled(ax, title, sub):
-    """
-    Title and grey subtitle, set together.
-
-    Two reasons this is a helper rather than two calls at each site. The
-    pad has to clear the subtitle, and the subtitle is pinned to the axes
-    top in offset points rather than at an axes fraction: elsewhere in the
-    project it sits at y = 1.012, which is 2 points on a short panel and 3
-    on a tall one, so whether it collides with the title depends on the
-    height of the panel it happens to be drawn in.
-
-    The title is passed in rather than read back with get_title(). This
-    project sets axes.titlelocation to "left", and get_title() reads the
-    centre title, so a helper that round-trips the text through it silently
-    erases the title it was meant to keep.
-    """
-    ax.set_title(title, pad=20)
-    ax.annotate(sub, xy=(0, 1.0), xycoords="axes fraction",
-                xytext=(0, 3), textcoords="offset points",
-                fontsize=7.5, color="#666666", va="bottom", ha="left",
-                annotation_clip=False)
-
 
 def figure_bands(d, daily):
     fig = plt.figure(figsize=(10, 6.8))
@@ -486,11 +488,11 @@ def figure_bands(d, daily):
     lin = max(1.0, float(np.ceil(np.nanmedian(up.to_numpy()) * 2)))
     ax_top.set_yscale("symlog", linthresh=lin, linscale=0.9)
     ax_top.set_ylabel("pips")
-    titled(ax_top,
-           "The mid basis against the band it would have had to cross",
-           f"the band is quoted, not assumed: it is the sum of the three "
-           f"legs' spreads at that minute. Symlog scale, linear within "
-           f"±{lin:.0f} pips")
+    panel_title(ax_top,
+                "The mid basis against the band it would have had to cross",
+                f"the band is quoted, not assumed: it is the sum of the three "
+                f"legs' spreads at that minute. Symlog scale, linear within "
+                f"±{lin:.0f} pips")
     ax_top.xaxis.set_major_locator(mdates.DayLocator(interval=7))
     ax_top.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     ax_top.legend(loc="lower left", ncol=2)
@@ -502,10 +504,10 @@ def figure_bands(d, daily):
                 ms=2.6, label="basis dispersion (MAD)")
     ax_bot.set_yscale("log")
     ax_bot.set_ylabel("pips (log scale)")
-    titled(ax_bot,
-           "Both widened under stress. The question is which widened more",
-           "on a log axis a parallel shift means the triangle was no closer "
-           "to arbitrageable than before, only noisier")
+    panel_title(ax_bot,
+                "Both widened under stress. The question is which widened more",
+                "on a log axis a parallel shift means the triangle was no closer "
+                "to arbitrageable than before, only noisier")
     ax_bot.xaxis.set_major_locator(mdates.DayLocator(interval=7))
     ax_bot.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     ax_bot.legend(loc="upper left", ncol=2)
@@ -527,8 +529,8 @@ def figure_executable(d, labels, names, colours, breakeven):
                      label=name, solid_capstyle="round")
     ax[0].set_xlabel("shortfall to the nearest bound $u$ (pips)")
     ax[0].set_ylabel(r"$P\,(\,\mathrm{shortfall} > u\,)$")
-    titled(ax[0], "How far inside the band the triangle sat",
-           "left is closer to executable")
+    panel_title(ax[0], "How far inside the band the triangle sat",
+                "left is closer to executable")
     ax[0].legend(loc="lower left")
     ax[0].grid(which="both", alpha=0.12)
 
@@ -574,9 +576,9 @@ def figure_decomposition(names, decomposition, daily_legs):
                            label=leg, step="mid")
         bottom = bottom + values
     ax[0].set_ylabel("pips")
-    titled(ax[0], "What the no-arbitrage band is made of, day by day",
-           "the three contributions sum to the band exactly; there is no "
-           "interaction term")
+    panel_title(ax[0], "What the no-arbitrage band is made of, day by day",
+                "the three contributions sum to the band exactly; there is no "
+                "interaction term")
     ax[0].xaxis.set_major_locator(mdates.DayLocator(interval=7))
     ax[0].xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     ax[0].legend(loc="upper left", ncol=3)
@@ -602,6 +604,65 @@ def figure_decomposition(names, decomposition, daily_legs):
 
 
 # --------------------------------------------------------------------- main
+
+def edge_velocity(d, labels, names, admit, fresh):
+    """
+    The bound, conditioned on how far prices travelled inside the second.
+
+    A one-second row is three separate feeds' last prints, not a snapshot.
+    When the market is moving, the gap between those prints is itself a
+    price change, and it enters the computed edge as though it were a
+    dislocation. That artefact grows with travel; a displacement that was
+    genuinely there does not.
+
+    Buckets are quintiles of travel over the pooled eligible sample rather
+    than within each regime, so a bucket is the same physical speed in
+    every column and the levels can be compared across regimes instead of
+    only the shapes.
+    """
+    pip = PIP["AUDJPY"]
+    au = (d.audusd_bid.to_numpy() + d.audusd_ask.to_numpy()) / 2.0
+    uj = (d.usdjpy_bid.to_numpy() + d.usdjpy_ask.to_numpy()) / 2.0
+    aj = (d.audjpy_bid.to_numpy() + d.audjpy_ask.to_numpy()) / 2.0
+
+    # Every leg's move is converted into AUD/JPY pips, so the maximum is
+    # over comparable quantities and not over three different units.
+    d_aj = np.abs(np.diff(aj, prepend=np.nan)) / pip
+    d_uj = np.abs(np.diff(uj, prepend=np.nan)) * au / pip
+    d_au = np.abs(np.diff(au, prepend=np.nan)) * uj / pip
+    travel = np.fmax(np.fmax(d_aj, d_uj), d_au)
+    # A difference across a closure is not a second of travel.
+    travel[~adjacent(d.index)] = np.nan
+
+    live = admit & fresh & np.isfinite(travel)
+    if not live.any():
+        return pd.DataFrame()
+    cuts = np.quantile(travel[live], [0.2, 0.4, 0.6, 0.8])
+    bucket = np.digitize(travel, cuts)
+    edge_pos = (d["edge"].to_numpy() > 0)
+
+    labs = [f"quintile {i + 1}" + (" (slowest)" if i == 0 else
+                                   " (fastest)" if i == 4 else "")
+            for i in range(5)]
+    rows = {}
+    for k, name in enumerate(names):
+        col, sel = {}, live & (labels == k)
+        for b, lab in enumerate(labs):
+            cell = sel & (bucket == b)
+            n = int(cell.sum())
+            col[f"{lab}, share"] = (float((cell & edge_pos).sum()) / n
+                                    if n else np.nan)
+        lo, hi = col[f"{labs[0]}, share"], col[f"{labs[4]}, share"]
+        col["fastest / slowest"] = hi / lo if lo else np.nan
+        col["median travel, all seconds (pips)"] = float(
+            np.nanmedian(travel[sel]))
+        rows[name] = col
+
+    out = pd.DataFrame(rows)
+    edges = ["0"] + [f"{c:.3f}" for c in cuts]
+    print("  travel quintile cuts (pips): " + ", ".join(edges[1:]))
+    return out
+
 
 def main():
     make_dirs()
@@ -660,7 +721,8 @@ def main():
             "band / dispersion": band / gap if gap else np.nan,
             "widest |basis| (pips)": float(rows["basis"].abs().max()),
             "best edge (pips)": float(rows["edge"].max()),
-            "executable seconds": int((rows["edge"] > 0).sum()),
+            "positive-edge seconds (upper bound)":
+                int((rows["edge"] > 0).sum()),
         }
     headline = pd.DataFrame(headline)
     save_table(
@@ -668,11 +730,36 @@ def main():
         caption=(f"The no-arbitrage band and the basis on the same seconds. "
                  f"Rows are restricted to seconds where all three legs quoted "
                  f"within {MAX_QUOTE_AGE}s and the regime posterior is at "
-                 f"least {MIN_POSTERIOR:.0%}. A positive edge is a complete "
-                 f"circuit at quoted prices; the band is the sum of the three "
-                 f"quoted spreads and is not a fitted or assumed cost."),
+                 f"least {MIN_POSTERIOR:.0%}. The band is the sum of the "
+                 f"three quoted spreads and is not a fitted or assumed cost. "
+                 f"The last row counts seconds whose three recorded quotes "
+                 f"would together have paid; it is an upper bound on "
+                 f"opportunity and not a measurement of it, because a "
+                 f"one-second grid cannot establish that the three legs "
+                 f"quoted simultaneously. See "
+                 f"Table~\\ref{{tab:edge_velocity}}."),
         label="tab:execution")
     print(headline.to_string(float_format=lambda v: f"{v:.4g}"))
+
+    # ------------------------------------------------- travel conditioning
+    print("bound against within-second travel")
+    velocity = edge_velocity(d, labels, names, admit, fresh)
+    if len(velocity):
+        save_table(
+            velocity, "05_edge_velocity",
+            caption=("The positive-edge count of Table~\\ref{tab:execution} "
+                     "split by how far the fastest leg moved inside the "
+                     "second, in quintiles of the pooled eligible sample. "
+                     "The three legs are separate feeds recorded on a "
+                     "one-second grid and are not known to have quoted "
+                     "together, so travel inside a second enters the "
+                     "computed edge as though it were a dislocation. A "
+                     "count concentrated in the fastest quintiles is the "
+                     "signature of that non-simultaneity rather than of an "
+                     "opportunity; a real displacement is indifferent to "
+                     "how fast the market was moving."),
+            label="tab:edge_velocity")
+        print(velocity.to_string(float_format=lambda v: f"{v:.4g}"))
 
     # ------------------------------------------------- the ratio comparison
     if len(names) >= 2 and "stress" in names:
@@ -739,7 +826,8 @@ def main():
             row = {"quote age gate (s)": "none" if gate is None else gate,
                    "execution delay (s)": delta}
             for name in names:
-                row[f"{name}, seconds"] = counts.loc["executable seconds", name]
+                row[f"{name}, seconds"] = counts.loc[
+                    "positive-edge seconds", name]
                 row[f"{name}, share"] = counts.loc["share", name]
             ladder.append(row)
     ladder = pd.DataFrame(ladder)
@@ -763,7 +851,8 @@ def main():
         row = {"spread haircut": k,
                "band as quoted": f"{k:.0%}"}
         for name in names:
-            row[f"{name}, seconds"] = counts.loc["executable seconds", name]
+            row[f"{name}, seconds"] = counts.loc[
+                "positive-edge seconds", name]
             row[f"{name}, share"] = counts.loc["share", name]
         haircut_rows.append(row)
     haircut = pd.DataFrame(haircut_rows)
@@ -853,7 +942,8 @@ def main():
             row[f"{name}, band (pips)"] = float(
                 d.loc[mask & (labels == k), "band"].median())
             row[f"{name}, eligible"] = counts.loc["eligible seconds", name]
-            row[f"{name}, executable"] = counts.loc["executable seconds", name]
+            row[f"{name}, positive-edge"] = counts.loc[
+                "positive-edge seconds", name]
         sens_rows.append(row)
     sens = pd.DataFrame(sens_rows)
     save_table(
@@ -906,12 +996,17 @@ def main():
             print(f"  [INFO] the first haircut at which any second clears is "
                   f"{k:.0%} of the quoted band")
         else:
-            print("  [INFO] no haircut in the ladder produces an executable "
-                  "second; widen HAIRCUTS if a tighter bound is of interest")
+            print("  [INFO] no haircut in the ladder produces a "
+                  "positive-edge second; widen HAIRCUTS if a tighter bound "
+                  "is of interest")
     else:
         share = ever / int((admit & fresh).sum())
-        print(f"  [INFO] {ever:,} executable seconds ({share:.3%} of the "
-              f"eligible sample) before any latency allowance")
+        print(f"  [INFO] {ever:,} seconds carry a positive quoted edge "
+              f"({share:.3%} of the eligible sample) before any latency "
+              f"allowance. This is an upper bound: the three legs are "
+              f"recorded on a one-second grid and are not known to have "
+              f"quoted together. Read it beside 05_edge_velocity.csv and "
+              f"the latency ladder before calling any of it tradeable.")
     worst_age = int(d.loc[admit & fresh, "max_age"].max())
     print(f"  [INFO] worst quote age inside the gate: {worst_age}s "
           f"(gate is {MAX_QUOTE_AGE}s)")

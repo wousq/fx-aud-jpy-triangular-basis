@@ -11,10 +11,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[1]
-# 00_ingest_and_sync.py writes here and 00b_data_quality.py reads here.
-# Section 02 of the notes shows data/synchronized_rates.parquet, one level
-# up; that document is the one that is out of date. The legacy location is
-# still accepted on load so an older working tree does not break.
+
 DATA_PATH = ROOT / "data" / "processed" / "synchronized_rates.parquet"
 LEGACY_DATA_PATH = ROOT / "data" / "synchronized_rates.parquet"
 FIG_DIR = ROOT / "output" / "figures"
@@ -35,10 +32,8 @@ PAIR_LABEL = {"audusd_mid": "AUD/USD", "usdjpy_mid": "USD/JPY",
 # microseconds, and DuckDB writes parquet TIMESTAMP in microseconds, so an
 # index arriving from data/processed is datetime64[us]. Comparing
 # index.asi8 against a nanosecond literal is then False everywhere and
-# every gap guard silently stops guarding — no exception, just increments
-# discarded and runs that span closures. numpy promotes timedelta64
-# operands to the finer unit, so the comparison below is correct at any
-# resolution.
+# every gap guard silently stops guarding.
+
 GRID_SECONDS = 1
 GRID_STEP = np.timedelta64(GRID_SECONDS, "s")
 
@@ -52,6 +47,7 @@ GRID_STEP = np.timedelta64(GRID_SECONDS, "s")
 # offset was established by measurement instead: an offset scan against
 # UTC-stamped Dukascopy ticks over the 2024-08-05 control window, which
 # agrees to 0.01 pips. See docs/data-quality.md.
+
 TZ_LABEL = "EDT"
 UTC_OFFSET_HOURS = -4
 
@@ -59,6 +55,7 @@ UTC_OFFSET_HOURS = -4
 # the data's clock. Derived from UTC_OFFSET_HOURS rather than hard-coded
 # so the two cannot drift apart. Plotting reference only: never passed to
 # any model, and no estimator is given this date as a candidate.
+
 BOJ_SHOCK = pd.Timestamp("2024-07-31 03:30:00") + pd.Timedelta(
     hours=UTC_OFFSET_HOURS)
 
@@ -513,6 +510,18 @@ def set_style():
         "savefig.dpi": 220,
     })
 
+def panel_title(ax, title, note):
+    """
+    Title with a subtitle line underneath it.
+
+    The subtitle is annotated at 1.012 in axes fraction and is about 10pt
+    tall, which is exactly the titlepad set above. Passing a larger pad
+    lifts the title clear of it. Titles without a subtitle keep the
+    default pad.
+    """
+    ax.set_title(title, pad=19)
+    ax.annotate(note, xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
+                color="#666666", va="bottom", ha="left")
 
 def envelope(series, rule="1min"):
     """

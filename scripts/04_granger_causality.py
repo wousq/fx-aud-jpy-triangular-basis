@@ -126,7 +126,7 @@ from scipy import stats
 
 from utils import (
     make_dirs, set_style, in_rollover, robust_scale, save_table, save_fig,
-    adjacent, check_grid,
+    adjacent, check_grid, panel_title,
     DAT_DIR, TAB_DIR, TEX_DIR,
     GRID_SECONDS, PAIR_LABEL, LEG_COLOUR, regime_colours,
     FOUND, MUTE, RULE,
@@ -1225,21 +1225,6 @@ def exogeneity_table(fits, names):
 
 # --------------------------------------------------------------------- figures
 
-def panel_title(ax, title, note):
-    """
-    Title with a subtitle underneath it.
-
-    The subtitle sits just above the axes, so the title has to be pushed clear
-    of it. rcParams sets a pad of 10, which is the height of the subtitle
-    itself and therefore exactly enough for the two to overlap; this passes a
-    local pad instead of editing utils, because changing the default there
-    would move every other figure in the project with it.
-    """
-    ax.set_title(title, pad=19)
-    ax.annotate(note, xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-                color="#666666", va="bottom", ha="left")
-
-
 def figure_attribution(att, names, colours):
     # One scale across both panels. They are the same quantity measured over
     # the two halves of the same episode, and on separate scales a share of
@@ -1267,12 +1252,11 @@ def figure_attribution(att, names, colours):
         ax[panel].margins(y=0.18)
         ax[panel].legend(loc="best", ncol=len(names))
 
-    panel_title(ax[0], "Which leg opened the gap",
-                "half the peak up to the widest second; no model, shares sum "
+    panel_title(ax[0], "Opening the gap: share by leg",
+                "from half the peak to the widest second; no model, shares sum "
                 "to one")
-    panel_title(ax[1], "Which leg closed it",
-                "the widest second back down to half — the mirror of the "
-                "left")
+    panel_title(ax[1], "Closing the gap: share by leg",
+                "the widest second back down to half the peak")
     save_fig(fig, "04_attribution")
 
 
@@ -1337,7 +1321,7 @@ def figure_lead_lag(cc, names, lags, fits, asym):
             top.set_ylabel(r"corr(basis$_t$, leg$_{t-h}$)")
             bottom.set_ylabel("asymmetry: corr at $+h$ minus corr at $-h$")
         panel_title(top, name, "h = 0 removed: the identity, not a result")
-        panel_title(bottom, f"{name} — who goes first", "band is ±2/√n")
+        panel_title(bottom, f"{name} lead-lag asymmetry", "band is ±2/√n")
         if k == 0:
             top.legend(loc="best")
             bottom.legend(loc="best")
@@ -1389,16 +1373,16 @@ def figure_granger(frame, placebo, names, colours):
         caps_y = np.concatenate([[t, t, np.nan] for t in thr])
         ax.plot(caps_x, caps_y, color=FOUND, lw=1.2, zorder=5)
     ax.plot([], [], color=RULE, lw=1.0, ls=(0, (3, 2)),
-            label="of which beyond one second")
+            label="contribution from lags beyond 1s")
     ax.plot([], [], color=FOUND, lw=1.2,
             label="placebo (same leg, another day)")
     ax.set_xticks(base)
     ax.set_xticklabels([f"{leg_label(j)} → basis" for j in range(3)])
     ax.set_ylabel("incremental predictable move (pips/s)")
     ax.margins(y=0.24)
-    panel_title(ax, "What one leg's recent history says about the next second "
+    panel_title(ax, "Predictive content of each leg for the next second of the basis"
                     "of the basis",
-                "given the basis's own memory; the orange cap is sampling "
+                "given the basis's own memory; orange marks the placebo level, which every bar exceeds"
                 "noise, which every bar clears on a one-second grid")
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12),
               ncol=len(names) + 2, borderaxespad=0.0)

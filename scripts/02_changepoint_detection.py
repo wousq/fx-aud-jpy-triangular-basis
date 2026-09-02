@@ -1,5 +1,5 @@
 """
-02_changepoint_detection.py
+2_changepoint_detection.py
 
 When did the AUD/JPY triangular basis change structure, and did it change
 back?
@@ -81,7 +81,7 @@ from scipy.special import gammaln, logsumexp
 
 from utils import (
     make_dirs, set_style, in_rollover, robust_scale, acf1, roll_noise,
-    noise_share, survival, save_table, save_fig, annotate_event,
+    noise_share, survival, save_table, save_fig, panel_title, annotate_event,
     annotate_interval, highlight_span,
     adjacent, check_grid,
     DAT_DIR, BOJ_SHOCK, TZ_LABEL, ROLLOVER_START, ROLLOVER_END,
@@ -1191,11 +1191,8 @@ def main():
     ax0.plot(full, disp.reindex(full).to_numpy(), lw=0.75, color=RULE, zorder=3)
     ax0.set_yscale("log")
     ax0.set_ylabel("dispersion, relative to\nthe same hour on a typical day")
-    ax0.set_title("Hourly dispersion of the basis, diurnal profile removed")
-    ax0.annotate("1.0 is the typical level for that time of day; the profile "
-                 "swings 4x across the day and has been divided out",
-                 xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-                 color="#666666", va="bottom", ha="left")
+    panel_title(ax0, "Hourly dispersion of the basis, diurnal profile removed",
+                "1.0 = the same hour on a typical day; the 4× diurnal profile is divided out")
     ax0.xaxis.set_major_locator(mdates.DayLocator(interval=7))
     ax0.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     annotate_event(ax0, BOJ_SHOCK, "BOJ")
@@ -1214,12 +1211,9 @@ def main():
     ax1.set_ylim(bottom=0)
     ax1.set_xlim(ax0.get_xlim())
     ax1.set_xlabel(TZ_LABEL)
-    ax1.set_title("Posterior over the changepoints")
-    ax1.annotate(
-        "the model is given no candidate date; shaded bands are the "
-        f"shortest {CRED_MASS:.0%} intervals",
-        xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-        color="#666666", va="bottom", ha="left")
+    panel_title(ax1, "Posterior over the changepoints",
+                "the model is given no candidate date; shaded bands are the "
+                f"shortest {CRED_MASS:.0%} intervals")
     ax1.xaxis.set_major_locator(mdates.DayLocator(interval=7))
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     annotate_event(ax1, BOJ_SHOCK, "BOJ", top=False)
@@ -1235,11 +1229,7 @@ def main():
                      solid_capstyle="round")
     ax[0].set_xlabel("threshold $u$ (pips)")
     ax[0].set_ylabel(r"$P\,(\,|\mathrm{basis}| > u\,)$")
-    ax[0].set_title("Tail by estimated regime")
-    ax[0].annotate("section 01 split this by calendar month; this split is "
-                   "estimated",
-                   xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-                   color="#666666", va="bottom", ha="left")
+    panel_title(ax[0], "Tail by estimated regime", " the split is estimated, not calendar")
     ax[0].legend(loc="lower left")
     ax[0].grid(which="both", alpha=0.12)
 
@@ -1255,11 +1245,8 @@ def main():
     ax[1].set_yscale("log")
     ax[1].set_xlabel("microstructure noise, Roll $c$ (pips)")
     ax[1].set_ylabel("dispersion, MAD (pips)")
-    ax[1].set_title("Dispersion against noise, by hour")
-    ax[1].annotate("if the stressed hours sat on the calm cloud, the widening "
-                   "would be noise",
-                   xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-                   color="#666666", va="bottom", ha="left")
+    panel_title(ax[1], "Dispersion against noise, by hour",
+                "noise alone would put every hour on one locus")
     ax[1].legend(loc="lower right")
     save_fig(fig, "02_regime_contrast")
 

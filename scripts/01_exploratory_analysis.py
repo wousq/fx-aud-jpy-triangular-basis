@@ -15,7 +15,7 @@ from utils import (
     make_dirs, set_style, load_data, add_basis, add_log_prices,
     unchanged, closed_mask, closure_report, episodes, in_rollover,
     summary_stats, robust_scale, acf1, roll_noise, noise_share, survival,
-    envelope, save_table, save_fig, zero_line, annotate_event,
+    envelope, save_table, save_fig, zero_line, panel_title, annotate_event,
     PAIRS, PAIR_LABEL, LEG_COLOUR, FOUND, MUTE, RULE, BOJ_SHOCK, DAT_DIR,
     TZ_LABEL, ROLLOVER_START, ROLLOVER_END,
 )
@@ -181,19 +181,14 @@ def main():
     ax_top.vlines(lo.index, lo.values, hi.values, color=RULE, lw=0.45)
     zero_line(ax_top)
     ax_top.set_yscale("symlog", linthresh=lin, linscale=0.7)
-    ax_top.set_ylabel("basis (pips)")
-    ax_top.set_title("AUD/JPY basis, direct minus synthetic · per-minute range")
-    ax_top.annotate(
-        f"symlog scale, linear within ±{lin:.0f} pips",
-        xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-        color="#666666", va="bottom", ha="left",
-    )
+    ax_top.set_ylabel("basis (pips)") 
+    panel_title(ax_top, "AUD/JPY basis, direct minus synthetic · per-minute range", f"symlog scale, linear within ±{lin:.0f} pips")
     ax_top.xaxis.set_major_locator(mdates.DayLocator(interval=7))
     ax_top.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     annotate_event(ax_top, BOJ_SHOCK, "BOJ")
 
     for ax, (start, end, series), title, shade in [
-        (ax_left, (b0, b1, b_boj), f"Announcement window · {BOJ_SHOCK:%d %b} ±{ZOOM_H}h", MUTE),
+        (ax_left, (b0, b1, b_boj), f"BOJ decision · {BOJ_SHOCK:%d %b} ±{ZOOM_H}h", MUTE),
         (ax_right, (p0, p1, b_pk), f"Widest episode · {peak_t:%d %b} ±{ZOOM_H}h", FOUND),
     ]:
         zlo, zhi, _ = envelope(series, "10s")
@@ -212,7 +207,7 @@ def main():
     ax_left.set_ylabel("basis (pips)")
     ax_right.tick_params(labelleft=False)
     ax_right.annotate(
-        f"episode threshold ±{threshold:.1f} pips",
+        f"episode threshold {threshold:.1f} pips",
         xy=(0.98, 0.04), xycoords="axes fraction",
         ha="right", va="bottom", fontsize=7, color=FOUND,
     )
@@ -256,12 +251,7 @@ def main():
     ax[1].xaxis.set_minor_formatter(plt.NullFormatter())
     ax[1].set_xlabel("episode duration (log scale)")
     ax[1].set_ylabel("peak |basis| (pips, log scale)")
-    ax[1].set_title("Every episode: duration against peak dislocation")
-    ax[1].annotate(
-        "marker points up when the direct price was rich, down when the synthetic was",
-        xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-        color="#666666", va="bottom", ha="left",
-    )
+    panel_title(ax[1], "Every episode: duration against peak dislocation", "up markers: direct rich; down markers: synthetic rich")
     ax[1].legend(loc="upper left")
     save_fig(fig, "01_episode_structure")
 
@@ -294,12 +284,7 @@ def main():
     ax[0].plot(daily.index, daily["mad"], lw=1.5, color=RULE, marker="o", ms=2.6, label="basis dispersion (MAD)")
     ax[0].plot(daily.index, daily["roll_c"], lw=1.5, color=FOUND, marker="D", ms=2.6, label="microstructure noise (Roll $c$)")
     ax[0].set_ylabel("pips")
-    ax[0].set_title("Daily dispersion versus microstructure noise")
-    ax[0].annotate(
-        "were the widening a staleness artefact, both series would move together",
-        xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-        color="#666666", va="bottom", ha="left",
-    )
+    panel_title(ax[0], "Daily dispersion versus microstructure noise", "a staleness artefact would move both series together")
     ax[0].legend(loc="upper right", ncol=2)
     annotate_event(ax[0], BOJ_SHOCK, "BOJ", top=False)
 
@@ -307,12 +292,7 @@ def main():
         ax[1].plot(quote_rate.index, quote_rate[column], lw=1.3, color=LEG_COLOUR[column], label=PAIR_LABEL[column])
     ax[1].set_ylabel("share of seconds")
     ax[1].set_ylim(0, 1)
-    ax[1].set_title("Quote arrival rate, by pair")
-    ax[1].annotate(
-        "higher intensity means less forward-filling, which works against finding persistence",
-        xy=(0, 1.012), xycoords="axes fraction", fontsize=7.5,
-        color="#666666", va="bottom", ha="left",
-    )
+    panel_title(ax[1], "Share of seconds with a new quote, by pair", "higher rates mean less forward-filling")
     ax[1].xaxis.set_major_locator(mdates.DayLocator(interval=7))
     ax[1].xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     ax[1].legend(loc="lower right", ncol=3)
