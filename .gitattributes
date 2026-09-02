@@ -1,5 +1,4 @@
 # ---------------------------------------------------------------- line endings
-#
 
 * text=auto eol=lf
 
@@ -13,12 +12,13 @@
 
 
 # ------------------------------------------------------- language statistics
-
+#
 *.tex           linguist-documentation
 report/**       linguist-documentation
 docs/**         linguist-documentation
 *.md            linguist-documentation
 
+report/tables/*.tex  -linguist-documentation linguist-generated
 
 output/**       linguist-generated
 *.csv           linguist-generated
