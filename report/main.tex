@@ -1,0 +1,1151 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{mathpazo}
+\usepackage[a4paper,margin=26mm,top=28mm,bottom=28mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{xcolor}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\sectionbreak}{\clearpage}
+
+% Figures are placed with [H] and sit where they are written. Every section
+% starts a new page, so a deferred float would otherwise be flushed onto a
+% page of its own and centred vertically with nothing around it.
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.7}
+\renewcommand{\textfraction}{0.1}
+\renewcommand{\floatpagefraction}{0.8}
+\setlength{\intextsep}{16pt plus 3pt minus 3pt}
+
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.8em}{}
+\titlespacing*{\section}{0pt}{0pt}{18pt}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.7em}{}
+\titlespacing*{\subsection}{0pt}{20pt}{8pt}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.6em}{}
+\titlespacing*{\subsubsection}{0pt}{14pt}{6pt}
+
+\captionsetup{font=small,labelfont=bf,skip=8pt}
+\setlength{\parskip}{6pt}
+\setlength{\parindent}{0pt}
+\linespread{1.06}
+
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\fancyfoot[C]{\small\thepage}
+
+\newcommand{\AU}{\mathrm{AU}}
+\newcommand{\UJ}{\mathrm{UJ}}
+\newcommand{\AJ}{\mathrm{AJ}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\begin{document}
+
+% =====================================================================
+\thispagestyle{empty}
+\vspace*{2.2cm}
+
+{\Huge\bfseries The AUD/JPY triangular basis\par}
+\vspace{10pt}
+{\Large Estimation and reconciliation at one-second resolution\par}
+
+\vspace{16pt}
+{\large AUD/JPY against AUD/USD $\times$ USD/JPY\\
+1 July to 30 August 2024\par}
+
+\vspace{2.2cm}
+\hrule
+\vspace{16pt}
+
+\textbf{Scope.} The triangular basis is the residual of the parity relation between
+AUD/JPY, AUD/USD and USD/JPY. This report documents the estimators used to measure that
+residual at one-second resolution over a window containing the August 2024 yen carry
+unwind, and reconciles the estimates that disagree. The residual remains inside the
+transaction-cost band throughout the sample; no arbitrage is identified and none is
+claimed.
+
+\textbf{Principal result.} Basis dispersion over the stress window is $3.09$ times its
+level in the calm segments when every second is pooled, and $1.22$ times when measured
+within the hour. Section~\ref{sec:reconcile} shows that the difference is a variance
+decomposition rather than a modelling disagreement. Day-to-day variation in the basis level
+accounts for $80.6\%$ of the stress window's level variance, against $11.6\%$ in the calm
+segments, and that split holds across every candidate regime boundary. Two days in that window fail the daily-bias check of
+Section~\ref{sec:grid} by a factor of fifteen and account for the entire mean level shift
+attributed to the regime.
+
+\textbf{Results independent of that decomposition.} Hourly dispersion is best described by
+a bounded excursion rather than a permanent shift, with posterior mass $1.000$ on the
+two-changepoint models and an observed log Bayes factor of $+97.1$ against a null 95th
+percentile of $-2.8$ (Section~\ref{sec:cp}). The transaction-cost band implied by quoted
+spreads exceeds the median basis by a factor of $12.7$ at its tightest
+(Section~\ref{sec:band}). The two dollar legs open the observed dislocations and the cross
+leg closes them, established both by arithmetic decomposition and under a sign restriction
+fixed before estimation (Sections~\ref{sec:vecm} and \ref{sec:attrib}).
+
+\vspace{16pt}
+\hrule
+\vspace{20pt}
+
+\textit{The emphasis throughout is on how each quantity is defined and why it is identified.
+Every number cited is reproduced from a table written by the pipeline. The appendix maps
+each claim to its file.}
+
+\clearpage
+
+% =====================================================================
+\section{The estimand}
+
+\subsection{The parity relation}
+
+Let $S^{\AU}_t$, $S^{\UJ}_t$ and $S^{\AJ}_t$ denote mid quotes for AUD/USD, USD/JPY and
+AUD/JPY. Absent frictions the cross rate is redundant, $S^{\AJ}_t = S^{\AU}_t S^{\UJ}_t$.
+The object of study is the residual of that relation, expressed in AUD/JPY pips:
+\begin{equation}
+z_t \;=\; \frac{S^{\AJ}_t - S^{\AU}_t S^{\UJ}_t}{10^{-2}} .
+\label{eq:basis}
+\end{equation}
+
+For the dynamic work the same quantity is written in logs. With
+$x_t = (x^{\AU}_t, x^{\UJ}_t, x^{\AJ}_t)^{\top}$ the vector of log prices scaled by $10^4$
+and
+\begin{equation}
+w = (-1,\,-1,\,+1)^{\top}, \qquad \tilde z_t = w^{\top} x_t ,
+\label{eq:logbasis}
+\end{equation}
+$\tilde z_t$ agrees with \eqref{eq:basis} to first order. The ratio between the two scales
+is measured at load rather than assumed, and holds to about two percent at the sample
+average of the cross.
+
+\subsection{The cointegrating vector is known}
+
+Triangular parity is a cointegrating restriction on $x_t$ with a known vector. The rank is
+one and the vector is $w$, both by arithmetic. Nothing about the relation is recovered from
+the data, which removes the Johansen procedure and the question of how many cointegrating
+relations the sample supports. Every dynamic statement below is therefore conditional on a
+restriction that cannot be misspecified, and any failure to find mean reversion is a
+statement about the market rather than about the specification.
+
+\subsection{Three distinct estimands}
+
+The phrase ``the basis widened'' names at least three quantities. They are defined here and
+returned to in Section~\ref{sec:reconcile}.
+
+\begin{enumerate}[leftmargin=2.2em,itemsep=6pt]
+  \item \textbf{Within-hour dispersion.} $\operatorname{MAD}(z_t : t \in h)$ for an hour
+  $h$. This is the feature the changepoint model of Section~\ref{sec:cp} fits.
+
+  \item \textbf{Within-day dispersion.} $\mathbb{E}_d[\operatorname{Var}(z \mid d)]^{1/2}$,
+  which pools hours within a day but not days.
+
+  \item \textbf{Pooled dispersion.} $\operatorname{Var}(z)^{1/2}$ over every second in a
+  regime, which additionally absorbs the movement of the daily mean.
+\end{enumerate}
+
+The three coincide only if the daily mean basis is constant. It is not, and under stress it
+is far from constant. That fact accounts for most of the disagreement between sections of
+this project.
+
+\subsection{Episodes}
+
+Dislocations in this sample are plateaus rather than isolated spikes, so several statements
+are made at the level of an episode: a maximal run of consecutive seconds with $|z_t| > u$,
+where $u = 2.42$ pips is the $99.95\%$ quantile of $|z|$ over July. Runs are split wherever
+consecutive observations are more than one grid step apart, which prevents an episode from
+spanning a market closure. Without that guard, exceedances either side of a weekend merge
+into a single 48-hour episode. Fifty-eight episodes are detected.
+
+% =====================================================================
+\section{Constructing the observation grid}
+\label{sec:grid}
+
+\subsection{The failure a tick audit cannot detect}
+
+The ingest stage audits every tick that exists: nulls, zeros, negatives, crossed quotes.
+That audit is silent on ticks that are absent, because a missing tick leaves no row to
+inspect. Forward-filling then substitutes a stale price, which is correct when a quote is
+late and wrong when a feed is dead. Nothing in the filled series distinguishes the two
+cases.
+
+Two design decisions follow. Every row carries an explicit freshness flag per leg, taken
+from whether that second contained a genuine tick rather than inferred from whether the
+price changed, since a repeated identical quote is fresh and a difference cannot detect
+that. And a separate gate runs between ingest and analysis.
+
+\subsection{Two statistics from the over-identification}
+
+Each leg is implied by the other two, for instance $\widehat{S^{\UJ}} = S^{\AJ}/S^{\AU}$,
+and the implied series must agree with the quoted one. Two statistics are taken from that
+gap. They detect different failures and neither detects the other's.
+
+\begin{itemize}[leftmargin=1.6em,itemsep=5pt]
+  \item The $99.9$th percentile of the \emph{absolute} gap, a tail statistic sensitive to a
+  frozen or wildly wrong leg. Observed: $3.21$, $7.29$ and $4.83$ pips against a threshold
+  of $25$.
+
+  \item The \emph{median signed} gap within each day. A leg biased by a fraction of a pip
+  moves this immediately and does not move the tail statistic at all, because the tail is
+  set by ordinary noise an order of magnitude larger.
+\end{itemize}
+
+The second failure is the more consequential, because everything downstream continues to
+look plausible and any analysis that differences, measures dispersion, or centres per day
+removes the bias before it becomes visible. Section~\ref{sec:limits} reports what this check
+returned.
+
+Closures are excluded from both statistics. Across a weekend the grid is forward-filled
+padding, so roughly $172{,}000$ identical values carry an identical frozen gap. Computed on
+the full grid, the $99$th and $99.9$th percentiles were bit-identical for all three legs and
+both equal to a single stale value.
+
+\subsection{Closures identified from the data}
+
+A second is classified as closed if it sits inside a run of at least ten minutes in which
+none of the three pairs printed a new price. Ten minutes of simultaneous silence across
+three majors does not occur while the market is open. Eight closures are found, all $48$
+hours to within two minutes, and no trading calendar is consulted. About $3.86$ million
+open-market seconds remain.
+
+\subsection{Two measurement decisions}
+
+\subsubsection*{The clock}
+
+Vendor timestamps are documented as EST, but the sample lies entirely inside US daylight
+saving, so the operative offset is UTC$-4$. The Friday-to-Sunday week boundary does not
+establish this, since FX closes at 17:00 New York local year-round and that boundary appears
+under either offset. The offset was determined by scanning candidate offsets against
+UTC-stamped ticks from a second vendor over a control window. At $-4$h the correlation is
+$1.00000$ with a gap standard deviation of $0.01$ pips; at $-5$h it is $-0.71$ and $48.65$
+pips.
+
+\subsubsection*{Quote pairing}
+
+Bid and ask are carried through the grid beside the mid and are always taken from a single
+tick. Three \code{ARG\_MAX} calls over one ordering key resolve to the same winning row, so
+the bid and ask columns are null in identical rows and the forward fill cannot pair a bid
+from one second with an ask from another. Taking $\max(\text{ask})$ with $\min(\text{bid})$
+across a second would produce a tighter aggregate and a spread no participant was shown.
+Section~\ref{sec:band} depends on this pairing, so it is asserted after the splice rather
+than assumed.
+
+% =====================================================================
+\section{Exact Bayesian segmentation}
+\label{sec:cp}
+
+\subsection{The feature}
+
+For each retained hour $h$, dispersion is summarised by the median absolute deviation
+rescaled to standard-deviation units:
+\[
+\operatorname{MAD}_h \;=\; 1.4826 \cdot \operatorname{median}_{t \in h}
+\bigl| z_t - \operatorname{median}_{s \in h} z_s \bigr| .
+\]
+The basis has excess kurtosis of $277$ over the full sample, so the hourly standard
+deviation is determined by a small number of seconds while the MAD is not. The model is
+fitted to $\log \operatorname{MAD}_h$, which makes a shift multiplicative and makes the
+feature close to symmetric over the roughly $3600$ observations per hour.
+
+Two nuisance profiles are subtracted. With $\mathrm{slot}(h)$ the within-day position of the
+bucket and $\mathrm{age}(h)$ the buckets elapsed since the session reopened,
+\begin{equation}
+y_h \;=\; \log \operatorname{MAD}_h \;-\; m\bigl(\mathrm{slot}(h)\bigr)
+\;-\; r\bigl(\min(\mathrm{age}(h), R)\bigr),
+\label{eq:deseason}
+\end{equation}
+where $m$ and $r$ are medians taken over the full sample. The diurnal amplitude is roughly
+fourfold peak to trough. The reopen term is required because a weekend closure is followed
+by a thin Sunday evening, so the first buckets of each week sit systematically high; without
+it, a regime ending during a closure is recorded a few hours after the reopen, since no
+bucket exists inside the gap for a changepoint to occupy.
+
+Both profiles are estimated over the whole sample and therefore cannot have been fitted
+either side of a candidate date. A common profile cannot create a level shift, only reduce
+one, so the adjustment works against the finding.
+
+\subsection{Marginal likelihood of a segment}
+
+Write a segment as a one-regressor regression
+\[
+\zeta_t \;=\; \mu \, \omega_t + e_t, \qquad e_t \sim \mathcal{N}(0, \sigma^2),
+\]
+which reduces to the ordinary segment mean when $\omega_t \equiv 1$ and also accommodates
+the AR(1) transform below without modification. Place a Normal-Inverse-Gamma prior,
+\[
+\mu \mid \sigma^2 \sim \mathcal{N}\!\left(m_0, \tfrac{\sigma^2}{\kappa_0}\right),
+\qquad
+\sigma^2 \sim \mathrm{Inv\text{-}Gamma}(a_0, b_0),
+\]
+and let $n$, $S_{\omega\omega} = \sum \omega_t^2$, $S_{\omega\zeta} = \sum \omega_t \zeta_t$
+and $S_{\zeta\zeta} = \sum \zeta_t^2$ be the sufficient statistics. Integrating out
+$(\mu,\sigma^2)$ gives a closed form. With
+\[
+\kappa_n = \kappa_0 + S_{\omega\omega}, \quad
+a_n = a_0 + \tfrac{n}{2}, \quad
+m_n = \frac{\kappa_0 m_0 + S_{\omega\zeta}}{\kappa_n}, \quad
+b_n = b_0 + \tfrac{1}{2}\!\left(S_{\zeta\zeta} + \kappa_0 m_0^2 - \kappa_n m_n^2\right),
+\]
+the log marginal likelihood is
+\begin{equation}
+\log p(\text{segment}) \;=\;
+\log\Gamma(a_n) - \log\Gamma(a_0)
++ a_0 \log b_0 - a_n \log b_n
++ \tfrac{1}{2}\bigl(\log \kappa_0 - \log \kappa_n\bigr)
+- \tfrac{n}{2}\log 2\pi .
+\label{eq:nig}
+\end{equation}
+
+Every input to \eqref{eq:nig} is available in $O(1)$ from cumulative sums, which is what
+makes exhaustive enumeration cheaper than sampling.
+
+The prior is weak but proper. $\kappa_0 = 0.01$ is one hundredth of an hour's worth of
+information about the segment mean, and $a_0 = 2$ is the smallest shape giving a finite
+prior mean for $\sigma^2$. Propriety matters because improper priors make the model
+comparison below undefined. The scale $b_0$ is set from the dispersion of the series being
+fitted, which is empirical Bayes; that dispersion is inflated by the shift under test, so
+the choice reduces the evidence for a change.
+
+\subsection{AR(1) errors across a market that closes}
+
+Hourly dispersion is strongly autocorrelated because volatility clusters. Under independent
+errors a run of above-average hours is not distinguishable from a level shift, and the
+estimator then selects an excursion on series containing no changepoint. Errors within a
+segment are therefore modelled as AR(1) with coefficient $\rho$.
+
+Whitening requires two cases, because the market closes weekly. Where bucket $h$ is adjacent
+in clock time to $h-1$, the one-step-ahead form applies:
+\[
+\zeta_h = y_h - \rho\, y_{h-1}, \qquad \omega_h = 1 - \rho .
+\]
+Where it is not, meaning the first bucket of the sample and the first bucket after every
+closure, there is no predecessor and the stationary marginal is used:
+\[
+\zeta_h = y_h \sqrt{1-\rho^2}, \qquad \omega_h = \sqrt{1-\rho^2}.
+\]
+Both place the observation on the same $\sigma$, so \eqref{eq:nig} applies unchanged. The
+stationary form is also used at the first bucket of every segment, whose predecessor belongs
+to a different segment with a different mean.
+
+$\rho$ is marginalised over a grid $\mathcal{R}$ spanning $[0, 0.90]$ under a uniform prior
+rather than profiled, so the reported evidence accounts for not knowing it:
+\[
+\log Z_M \;=\; \log \sum_{\rho \in \mathcal{R}} \exp\bigl(\log Z_M(\rho)\bigr)
+- \log|\mathcal{R}| .
+\]
+The grid includes zero, so the independent-error model is nested and the data can return it.
+The upper end stops short of one, where a level shift and a random walk are not separately
+identified.
+
+\subsection{Model space and enumeration}
+
+Four models are compared over $n$ retained buckets, with $m$ the minimum admissible segment
+length:
+\begin{center}
+\begin{tabular}{@{}llp{7.4cm}@{}}
+\toprule
+$M_0$ & no change & one segment $[0,n)$ \\
+$M_1$ & permanent shift & one changepoint $\tau$ \\
+$M_2$ & excursion & two changepoints; the outer segments share one set of parameters \\
+$M_3$ & two free changes & two changepoints; three free segments \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+$M_0$ is included because a one-changepoint model always returns a changepoint. Without a
+no-change alternative in the comparison, the selected date carries no information about
+whether a change occurred. $M_2$ separates the two substantive hypotheses: a new regime
+against a bounded window followed by a return.
+
+Changepoints are discrete and there are at most two, so the posterior is computed by
+enumerating every admissible configuration. Writing
+$\mathcal{T} = \{(\tau_1,\tau_2) : \tau_1 \geq m,\ \tau_2 - \tau_1 \geq m,\ n - \tau_2 \geq m\}$
+and $\ell$ for the sum of \eqref{eq:nig} over the segments a configuration induces, the
+evidence under a uniform prior over configurations is
+\begin{equation}
+\log Z_{M_k} \;=\; \log \sum_{c \in \mathcal{C}_k} \exp\bigl(\ell(c)\bigr)
+\;-\; \log |\mathcal{C}_k| .
+\label{eq:enumerate}
+\end{equation}
+The result is exact. There are no chains, no convergence diagnostics, and the output is
+identical on every run. Posterior model probabilities follow from \eqref{eq:enumerate} with
+equal model priors.
+
+$M_2$ and $M_3$ share their three blocks. $M_2$ pools the outer two into one regime, which
+is exact because sufficient statistics are additive across conditionally independent
+segments, while $M_3$ gives them separate means. Computing the three blocks once and
+combining them reduces the work from five passes over the configuration set to three.
+
+Marginal posteriors over each changepoint follow by summation. The excursion indicator is
+obtained from a difference array, so the cost is $O(|\mathcal{T}|)$ rather than
+$O(|\mathcal{T}| \cdot n)$:
+\[
+p_{\text{onset}}(t) = \!\!\sum_{(t,\tau_2) \in \mathcal{T}}\!\! W(t,\tau_2),
+\qquad
+\Pr(h \text{ elevated}) = \!\!\sum_{\tau_1 \leq h < \tau_2}\!\! W(\tau_1,\tau_2),
+\qquad
+W \propto e^{\ell}.
+\]
+
+Reported intervals are the shortest contiguous window carrying $95\%$ of the marginal rather
+than a highest-density set. The posterior over a changepoint is often multimodal, and a set
+of disjoint hours does not correspond to a date range. The interval is conservative where
+modes separate.
+
+\subsection{Result and calibration}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Model & Changepoints & $\log Z$ & Posterior \\
+\midrule
+$M_0$ no change            & 0 & $605.8$ & $2.7\times10^{-43}$ \\
+$M_1$ permanent shift      & 1 & $645.4$ & $4.5\times10^{-26}$ \\
+$M_2$ excursion            & 2 & $702.8$ & $0.384$ \\
+$M_3$ two free changes     & 2 & $703.3$ & $0.616$ \\
+\bottomrule
+\end{tabular}
+\caption{Marginal likelihood of each segmentation of hourly log dispersion. Posterior mass
+on the two-changepoint models is $1.000$ to three decimals. Source:
+\code{02\_model\_evidence.csv}.}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{02_changepoint_posterior.png}
+\caption{Hourly dispersion with the diurnal profile divided out, and the marginal posterior
+over each changepoint. The onset posterior is bimodal, with mass at 24 July and again at the
+policy decision on 30 July; the return is better localised. Fitted segment levels are
+$0.093$, $0.111$ and $0.091$ pips, a within-hour ratio of $1.19$ to $1.22$ against a pooled
+ratio of $3.09$ discussed in Section~\ref{sec:reconcile}. No candidate date was supplied to
+any model.}
+\end{figure}
+
+A Bayes factor measures how much better $M_2$ fits than $M_0$ on this series. It does not
+establish that a series without a changepoint would have looked different. One hundred
+replicates were simulated with the sample's length, session structure, fitted $\rho$ and
+residual scale, and no change anywhere, then refitted with the same code.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+$\Pr(\text{any change selected} \mid \text{no change})$ & $0.020$ \\
+$\Pr(\text{excursion selected} \mid \text{no change})$  & $0.010$ \\
+Null $\log$ BF, 95th percentile                         & $-2.8$ \\
+Observed $\log$ BF ($M_2$ against $M_0$)                & $+97.1$ \\
+Fraction of null replicates the observation exceeds     & $1.000$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The AR(1) term produces that calibration. Under independent errors the same code selects an
+excursion on noise in roughly four series out of five. All twenty specifications in
+\code{02\_sensitivity.csv} select a two-changepoint model, varying the summary statistic,
+bucket width, prior scale, minimum segment length, both admission filters, the
+deseasonalisation, the rollover boundary and the error model. None selects $M_0$ or $M_1$.
+
+% =====================================================================
+\section{Error correction under a known cointegrating vector}
+\label{sec:vecm}
+
+\subsection{Specification}
+
+With the cointegrating vector imposed, the system is a vector error-correction model:
+\begin{equation}
+\Delta x_t \;=\; c \;+\; \alpha\, \tilde z_{t-1}
+\;+\; \sum_{i=1}^{p} \Gamma_i \, \Delta x_{t-i} \;+\; e_t ,
+\qquad \alpha \in \mathbb{R}^3,\ \Gamma_i \in \mathbb{R}^{3\times3},
+\label{eq:vecm}
+\end{equation}
+fitted separately inside each estimated regime. A VAR in returns would discard $\tilde z_t$,
+which is the only variable in the system that is not a martingale and the only one the
+parity condition constrains.
+
+The lag order is $p = 21$ seconds, the cap of the tested grid $\{1,2,3,5,8,13,21\}$. BIC is
+still improving at the cap, which is recorded rather than presented as clean selection;
+\code{03\_sensitivity.csv} refits at $p \in \{1,5\}$ and the ordering of the regimes is
+unchanged.
+
+\subsection{$\lambda = w^{\top}\alpha$ is an identity}
+
+From \eqref{eq:logbasis}, $\tilde z_t = w^{\top}x_t = w^{\top}(x_{t-1} + \Delta x_t)$, so
+\begin{equation}
+\tilde z_t \;=\; \tilde z_{t-1} + w^{\top} \Delta x_t
+\label{eq:zident}
+\end{equation}
+holds exactly. Pre-multiplying \eqref{eq:vecm} by $w^{\top}$ and substituting,
+\[
+\Delta \tilde z_t \;=\; w^{\top}c \;+\; \underbrace{(w^{\top}\alpha)}_{\textstyle \lambda}
+\tilde z_{t-1} \;+\; \sum_{i=1}^{p} (w^{\top}\Gamma_i)\,\Delta x_{t-i} \;+\; w^{\top}e_t .
+\]
+$\lambda$ is therefore the one-step closure rate of the basis, obtained from the system
+without a separate regression.
+
+\subsection{The sign restriction is a test}
+
+Signs are predicted before estimation. If $\tilde z > 0$ the direct rate is rich against the
+synthetic, so closure requires the direct leg to fall and the synthetic to rise:
+\[
+\alpha_{\AJ} < 0, \qquad \alpha_{\AU} > 0, \qquad \alpha_{\UJ} > 0,
+\qquad \text{hence} \qquad \lambda = -\alpha_{\AU} - \alpha_{\UJ} + \alpha_{\AJ} < 0 .
+\]
+All four hold in all three regimes at $|t|$ between $2.4$ and $11.5$
+(\code{04\_weak\_exogeneity.csv}).
+
+\subsection{Two half-lives}
+
+$\lambda$ describes the first second only. The transitory terms can accelerate or delay the
+remainder, so the decay of a full dislocation requires the system. Define the state
+\[
+s_t \;=\; \bigl(\tilde z_t,\; \Delta x_t^{\top},\; \Delta x_{t-1}^{\top},\;\dots,\;
+\Delta x_{t-p+1}^{\top}\bigr)^{\top} \in \mathbb{R}^{1+3p}.
+\]
+Combining \eqref{eq:vecm} with the identity \eqref{eq:zident} gives $s_t = M s_{t-1}$ in the
+absence of shocks, where
+\begin{equation}
+M \;=\;
+\begin{pmatrix}
+1 + w^{\top}\alpha & w^{\top}\Gamma_1 & \cdots & w^{\top}\Gamma_p \\[2pt]
+\alpha & \Gamma_1 & \cdots & \Gamma_p \\[2pt]
+0 & I_3 & & \\
+& & \ddots & \\
+0 & & I_3 & 0
+\end{pmatrix}.
+\label{eq:companion}
+\end{equation}
+The first row of \eqref{eq:companion} is the identity \eqref{eq:zident}, not an additional
+assumption. The decay path of a unit dislocation is $h(k) = (M^k e_1)_1$, and the
+full-system half-life is the first crossing of $\tfrac12$, interpolated between the
+bracketing steps.
+
+The spectral radius of $M$ is the stationarity check the error-correction reading requires.
+With the cointegrating vector imposed the system carries no unit root in this state, so an
+eigenvalue at or above one would mean the regime's basis is not mean-reverting. Observed
+values are $0.9889$, $0.9957$ and $0.9841$.
+
+\subsection{Precision is not uniform across $\alpha$}
+
+The three components of $\alpha$ are estimated far less precisely than their combination.
+Each leg's own volatility is orders of magnitude larger than the basis, so regressing that
+leg's return on the basis carries a large error variance, while $\lambda$ is a combination
+in which the common moves cancel by construction. The closure-rate claim is consequently
+better supported than the leg-split claim, and the tables do not present them as equally
+reliable.
+
+\subsection{HAC for a single linear functional}
+
+Increments carry first-order autocorrelation between $-0.30$ and $-0.42$ from bid-ask
+bounce, so OLS standard errors are wrong by a non-negligible factor. Standard errors are
+Newey-West.
+
+The full HAC matrix for a three-equation system with $K$ regressors is $3K \times 3K$ and
+requires lagged cross-products of an $(n, 3K)$ array. At a million seconds and sixty-five
+regressors it is not worth forming, and it is not needed. Only the $\tilde z_{t-1}$
+coefficient is of interest, and for a single linear functional the sandwich collapses.
+Writing $u_t \in \mathbb{R}^3$ for the residual vector and $e_j$ for the selector of the
+error-correction column,
+\[
+\hat\alpha - \alpha
+\;=\; \sum_t \underbrace{e_j^{\top}(X^{\top}X)^{-1} x_t}_{\textstyle h_t \in \mathbb{R}}
+\; u_t^{\top},
+\]
+so the required $3 \times 3$ covariance is the long-run covariance of the single vector
+series $\varphi_t = h_t u_t$.
+
+That covariance is computed from overlapping block sums rather than a loop over lags. Let
+$B_s = \sum_{i=0}^{m-1} \varphi_{s+i}$. Expanding,
+\[
+\frac{1}{m}\sum_s B_s B_s^{\top}
+= \frac{1}{m}\sum_s \sum_{i,j=0}^{m-1} \varphi_{s+i}\varphi_{s+j}^{\top}
+= \sum_{|k| < m} \frac{m - |k|}{m}\, \Gamma_k
+= \sum_{|k| < m}\left(1 - \frac{|k|}{m}\right)\Gamma_k ,
+\]
+since exactly $m - |k|$ ordered pairs $(i,j)$ in $[0,m)^2$ satisfy $i - j = k$. This
+reproduces the Bartlett kernel with truncation $m-1$ exactly, up to the first and last $m-1$
+rows of each contiguous run. With runs hours long and $m$ of the order of a minute, that
+edge term is around $10^{-5}$ of the total. Blocks that would straddle a break are refused.
+
+\subsection{Row admission}
+
+A lag window is admitted only where the whole span of $p+2$ consecutive seconds is
+contiguous in clock time, outside the daily rollover window, inside one regime and one
+trading day, and labelled with regime posterior at least $90\%$. Nothing is differenced
+across a weekend, a closure, a rollover exclusion or a regime boundary.
+
+Using the posterior rather than the hard boundary places a buffer around each changepoint
+that is derived from the data instead of chosen. Both changepoints span market closures, so
+some buffer is required. The row set is fixed once at the lag cap and reused for every lag
+order and every regime, so no two numbers in the output are computed on different samples.
+
+The segment boundaries come from the median segmentation of Section~\ref{sec:cp} and are
+read from the labels rather than typed as dates. The onset boundary is a choice between two
+posterior modes and is discussed in Section~\ref{sec:onset}; the alternative is carried as a
+row of \code{03\_sensitivity.csv} so its cost can be read off.
+
+One further choice matters for Section~\ref{sec:reconcile}. The error-correction term is
+centred on the day. Centring on the regime leaves drift in the daily mean inside the residual, where
+the estimator reads it as persistence: that variant returns a stress half-life of $967$
+seconds against a baseline of $155$.
+
+% =====================================================================
+\section{Attribution}
+\label{sec:attrib}
+
+Three routes, sharing no machinery, in increasing order of what each assumes.
+
+\subsection{By identity}
+
+From \eqref{eq:zident}, the change in the basis over any window is exactly the sum of three
+leg contributions:
+\[
+\tilde z_{t_1} - \tilde z_{t_0} \;=\; \sum_{k \in \{\AU,\UJ,\AJ\}} w_k
+\bigl(x^{k}_{t_1} - x^{k}_{t_0}\bigr).
+\]
+Applying this to the opening and closing window of each detected episode splits both by
+arithmetic, with no model and no lag order.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Share of the move & pre & stress & post \\
+\midrule
+Opening: AUD/USD $+$ USD/JPY & $0.86$ & $1.12$ & $1.05$ \\
+Closing: AUD/JPY             & $0.64$ & $0.71$ & $0.48$ \\
+\midrule
+Median seconds to open  & 2 & 19 & 4 \\
+Median seconds to close & 3 & 24 & 4 \\
+\bottomrule
+\end{tabular}
+\caption{Episode-level attribution. Shares can exceed one because leg contributions can
+oppose. Source: \code{04\_attribution.csv}.}
+\end{table}
+
+\subsection{By correlation and by test}
+
+Cross-correlations between each leg's increments and the basis's are computed at matched
+leads and lags out to a minute, on pairs inside one unbroken run. Block Granger tests are
+then run inside \eqref{eq:vecm}.
+
+A degeneracy has to be handled. The basis is a fixed combination of the three legs, so at
+every lag the three legs' increments together span the basis's own lagged increment.
+Dropping any one leg's block removes part of the basis's own autoregression along with that
+leg's information, and when the basis is persistent all three blocks then test large for
+that reason alone. The headline test therefore conditions on the basis's own history
+explicitly: for each leg, a smaller model containing the basis level, the basis's own lagged
+increments and that one leg's lagged increments, asking what the leg adds beyond the basis's
+own memory. The full-system figure is reported beside it as a control. Neither model is
+refitted; both are column subsets of one extended design whose cross-products are
+accumulated once.
+
+\subsection{Effect sizes rather than $p$-values}
+
+Every test runs on between one hundred thousand and a million seconds. At that size a
+coefficient of no economic consequence rejects at any conventional level. Each test
+therefore carries an effect size, the incremental predictable move in pips per second,
+beside a placebo threshold computed from the same statistic with that leg's increments drawn
+from a different day. The placebo preserves the leg's own autocorrelation and volatility
+clustering and destroys only the cross-leg timing, so it is the distribution of the
+statistic when the null holds and everything else is unchanged.
+
+The results separate cleanly. Cross-leg effects clear their placebo by $3.5$ to $10.6$
+times. Leg-to-basis effects, conditioned on the basis's own memory, explain between $0.01\%$
+and $0.07\%$ of basis increment variance; AUD/JPY fails Holm correction in all three regimes
+and USD/JPY in two. The basis is close to unforecastable from its own components while those
+components remain highly forecastable from each other.
+
+\subsection{Why no Hasbrouck or Gonzalo-Granger shares}
+
+Those measures are defined for two prices of one asset: one cointegrating vector, one common
+trend, and loadings that split into shares summing to one. This system has three prices and
+one restriction, so it has two common trends, an AUD trend and a JPY trend, and
+$\alpha_{\perp}$ is $3 \times 2$ rather than a vector. No scalar share per leg is identified
+without a normalisation the data does not supply. The weak-exogeneity tests are the part of
+that framework this system supports, and they are what is reported.
+
+% =====================================================================
+\section{The transaction-cost band}
+\label{sec:band}
+
+\subsection{The two round trips}
+
+Sections~\ref{sec:cp} and \ref{sec:vecm} work on mid quotes, which is the correct series for
+measuring how prices adjust and the wrong one for asking whether a dislocation was
+executable. A round trip crosses three spreads. Writing $b$ and $a$ for bid and ask in
+AUD/JPY price units,
+\[
+e_A = \AJ_b - \AU_a \UJ_a \quad (\text{sell direct, buy synthetic}), \qquad
+e_B = \AU_b \UJ_b - \AJ_a \quad (\text{buy direct, sell synthetic}).
+\]
+Each is the profit per unit of AUD from one complete circuit at prices that were quoted.
+They cannot be positive together, since $e_A > 0$ and $e_B > 0$ would require
+$\AJ_b > \AJ_a$.
+
+\subsection{The band, and the exact cancellation}
+
+Let $z$ be the mid basis. Then $e_A = z - c_A$ and $e_B = -z - c_B$ with
+\[
+c_A = (\AJ_m - \AJ_b) + (\AU_a \UJ_a - \AU_m \UJ_m), \qquad
+c_B = (\AJ_a - \AJ_m) + (\AU_m \UJ_m - \AU_b \UJ_b),
+\]
+so nothing is executable while $z \in [-c_B, +c_A]$. The width of that band is
+\[
+W = c_A + c_B = \underbrace{(\AJ_a - \AJ_b)}_{s_{\AJ}}
+\;+\; \bigl(\AU_a \UJ_a - \AU_b \UJ_b\bigr).
+\]
+Writing each quote as its mid plus or minus half a spread, the second term expands as
+\[
+\left(\AU_m + \tfrac{s_{\AU}}{2}\right)\!\left(\UJ_m + \tfrac{s_{\UJ}}{2}\right)
+- \left(\AU_m - \tfrac{s_{\AU}}{2}\right)\!\left(\UJ_m - \tfrac{s_{\UJ}}{2}\right)
+= \AU_m s_{\UJ} + \UJ_m s_{\AU},
+\]
+the quadratic terms cancelling in the difference. Therefore
+\begin{equation}
+\boxed{\;W \;=\; s_{\AJ} \;+\; \AU_m \, s_{\UJ} \;+\; \UJ_m \, s_{\AU}\;}
+\label{eq:band}
+\end{equation}
+holds exactly rather than to first order. The band decomposes additively across the three
+legs with no interaction term, so which leg sets the bound is determined by arithmetic.
+Nothing in \eqref{eq:band} is estimated and no cost parameter is assumed.
+
+\subsection{The band in units of the basis}
+
+Section~\ref{sec:cp} measured a numerator. Equation \eqref{eq:band} supplies the
+denominator. The quantity of interest is $W / \operatorname{MAD}(z)$ per regime, computed on
+the same seconds.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ & pre & stress & post \\
+\midrule
+Band width $W$, median (pips)      & $2.61$ & $3.35$ & $2.57$ \\
+Basis dispersion, MAD (pips)       & $0.112$ & $0.264$ & $0.095$ \\
+Band / dispersion                  & $23.3$ & $12.7$ & $27.1$ \\
+\bottomrule
+\end{tabular}
+\caption{Rows restricted to seconds where all three legs quoted within one second and the
+regime posterior is at least $90\%$. Source: \code{05\_execution.csv}.}
+\end{table}
+
+Both quantities widened. The dispersion grew by $2.35$ and the band by $1.29$, so the
+band-to-gap ratio approximately halved. The basis moved closer to the band and remained an
+order of magnitude inside it.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{05_bands.png}
+\caption{The mid basis against the band it would have had to cross. On the log axis of the
+lower panel a parallel shift indicates that the band-to-gap ratio did not change.}
+\end{figure}
+
+\subsection{Sensitivity to the spread level}
+
+Both vendors publish aggregator quotes, which are wider than interdealer, so the comparison
+is biased toward finding no executable dislocation. Every spread is therefore scaled by a
+factor $k$, equivalent to $e_A(k) = z - k c_A$ and $e_B(k) = -z - k c_B$ with the mid basis
+held fixed, and the share of seconds with a positive edge is reported as a function of $k$.
+Halving every quoted spread leaves $99.95\%$ of calm seconds inside the band; only at a
+tenth of quoted do the calm regimes reach $22.6\%$ and $14.4\%$ (\code{05\_haircut.csv}).
+
+\subsection{Why a positive edge is not an opportunity}
+
+The grid is one second wide and the three legs are separate feeds, so a row records the last
+print of each leg inside that second rather than three prices known to have stood together.
+Triangular parity requires simultaneity across all three. A positive edge computed from this
+grid is therefore an upper bound on what was available and not a measurement of it: when
+prices travel far enough inside a second, the separation between prints produces an apparent
+edge, and second resolution cannot distinguish the two readings. No finer data exists for
+these pairs from either vendor.
+
+Two diagnostics are reported in place of an assertion. A real opportunity decays as the
+delay between signal and fill grows and a measurement artefact does not; the observed count
+is flat across execution delays of zero to five seconds. A displacement that was present is
+indifferent to how fast the market was moving and non-simultaneity is not; the count is not
+concentrated in the fastest quintiles of within-second travel. Both point away from reading
+the stress count as opportunity.
+
+% =====================================================================
+\section{Reconciliation}
+\label{sec:reconcile}
+
+Five routes to the closure speed of the basis are distributed across the preceding sections
+and they do not agree.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}llr@{}}
+\toprule
+Route & What it estimates & Stress / calmest \\
+\midrule
+Episode ruler            & time for a large excursion to halve & $9.3$ \\
+AR(1) on the level       & decay of an average deviation, one parameter & $9.7$ \\
+VECM, one-step           & decay implied by $\lambda$ alone & $2.9$ \\
+VECM, full system        & decay of the 21-lag system run down & $4.1$ \\
+VECM, day by day, median & the typical day rather than the typical second & $1.4$ \\
+\bottomrule
+\end{tabular}
+\caption{Source: \code{06\_closure\_reconciliation.csv}.}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{03_closure_speed.png}
+\caption{Each day fitted on its own, with no regime label supplied. The pooled stress mean
+of $155$ seconds sits above every stress day but one, which is the disagreement the rest of
+this section accounts for. Discussed in Section~7.4.}
+\end{figure}
+
+\subsection{Decomposing the level change}
+
+For a stationary AR(1) level with innovation scale $\sigma$ and coefficient $\rho$,
+\begin{equation}
+\operatorname{sd}(z) \;=\; \frac{\sigma}{\sqrt{1-\rho^{2}}},
+\qquad\text{so}\qquad
+\log \frac{\operatorname{sd}(z)_A}{\operatorname{sd}(z)_B}
+= \underbrace{\log \frac{\sigma_A}{\sigma_B}}_{\text{noise}}
++ \underbrace{\log \frac{\sqrt{1-\rho_B^{2}}}{\sqrt{1-\rho_A^{2}}}}_{\text{persistence}} .
+\label{eq:ampl}
+\end{equation}
+The split is additive on the log scale. The innovation scale of the basis does not need
+separate estimation, because $\varepsilon_z = w^{\top}e$ and therefore
+\begin{equation}
+\sigma^2 \;=\; w^{\top} \Sigma\, w
+\;=\; \sigma_{\AU}^2 + \sigma_{\UJ}^2 + \sigma_{\AJ}^2
++ 2\sigma_{\AU}\sigma_{\UJ}\rho_{\AU\UJ}
+- 2\sigma_{\AU}\sigma_{\AJ}\rho_{\AU\AJ}
+- 2\sigma_{\UJ}\sigma_{\AJ}\rho_{\UJ\AJ},
+\label{eq:sigmaz}
+\end{equation}
+reconstructible from the per-leg residual scales and correlations that \eqref{eq:vecm}
+already produces. Substituting them reproduces the measured level dispersion to within
+$6\%$ to $17\%$ across all three regimes, which confirms that \eqref{eq:ampl} and
+\eqref{eq:sigmaz} describe the same object.
+
+\subsection{What the pooled statistic measures}
+
+Equation \eqref{eq:ampl} attributes the widening to larger shocks and slower reversion. That
+attribution is incomplete, because $\operatorname{sd}(z)$ is a pooled quantity. Splitting the
+level variance on the trading day $d$,
+\begin{equation}
+\operatorname{Var}(z)
+\;=\; \underbrace{\mathbb{E}_d\bigl[\operatorname{Var}(z \mid d)\bigr]}_{\text{within-day}}
+\;+\; \underbrace{\operatorname{Var}_d\bigl(\mathbb{E}[z \mid d]\bigr)}_{\text{day-to-day}} .
+\label{eq:totalvar}
+\end{equation}
+Both terms are evaluated on the same seconds by \code{07\_boundary\_sweep.py}, which
+accumulates per-hour sums once and aggregates them into per-day cells. The same widening
+then reads differently at four nested scopes, and nothing about the market changes between
+the rows.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+Scope of the measurement & Stress / calm \\
+\midrule
+Within the hour (MAD)                          & $1.21$ \\
+Within the day (sd)                            & $1.98$ \\
+Pooled across the window, robust (MAD)         & $2.91$ \\
+Pooled across the window, non-robust (sd)      & $4.22$ \\
+\midrule
+Day-to-day share of level variance, stress     & $80.6\%$ \\
+Day-to-day share of level variance, calm       & $11.6\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Applying \eqref{eq:totalvar} at the segmentation in use. Calm pools the pre and
+post segments. Source: \code{07\_boundary\_named.csv}.}
+\end{table}
+
+Four fifths of what the pooled statistic calls dispersion under stress is the level moving
+between days. Each step up the ladder admits another layer of that movement. The within-hour
+figure of $1.21$ agrees with the $1.19$ to $1.22$ the changepoint model returned
+independently from hourly buckets, which is the check that the decomposition and the fit
+describe the same object.
+
+\subsection{The decomposition does not turn on the regime boundary}
+\label{sec:sweep}
+
+Section~\ref{sec:onset} records that the onset posterior is bimodal and that the boundary in
+use is the median rather than the mode. Every quantity above is conditioned on that choice.
+
+Rather than evaluate the decomposition at one boundary, or at two,
+\code{07\_boundary\_sweep.py} evaluates it at every hourly onset between 23 and 31 July under
+both candidate returns, $128$ boundaries in total. The decomposition is a closed form in
+per-day sufficient statistics, so a boundary costs $O(\text{hours})$ rather than
+$O(\text{seconds})$. Nothing is refitted; the basis series is re-aggregated.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ & median rule (in use) & modal rule & all $128$ boundaries \\
+\midrule
+Onset                        & 30 Jul 15:00 & 24 Jul 17:00 & 23 to 31 Jul \\
+Return                       & 09 Aug 10:00 & 13 Aug 19:00 & both \\
+Stress window (hours)        & $183$ & $331$ & $160$ to $354$ \\
+Day-to-day share, stress     & $80.6\%$ & $78.7\%$ & $78.7\%$ to $87.3\%$ \\
+Day-to-day share, calm       & $11.6\%$ & $11.8\%$ & $10.2\%$ to $12.9\%$ \\
+Within-hour MAD ratio        & $1.21$ & $1.13$ & $1.12$ to $1.21$ \\
+Pooled MAD ratio             & $2.91$ & $1.63$ & \\
+\bottomrule
+\end{tabular}
+\caption{The decomposition as a function of the boundary. Source:
+\code{07\_boundary\_named.csv} and \code{07\_boundary\_sweep.csv}.}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{07_boundary_sweep.png}
+\caption{The decomposition at every candidate onset, under both candidate returns. The
+upper panel is flat across the swept range, so the headline does not turn on the boundary.
+In the lower panel the pooled ratio rises with the boundary while the two decomposed
+ratios do not, and the gap between them is the pooling effect.}
+\end{figure}
+
+The day-to-day share stays between $78.7\%$ and $87.3\%$ across every boundary tested,
+against $10.2\%$ to $12.9\%$ in the calm segments, over stress windows ranging from $160$ to
+$354$ hours. The within-hour widening moves by $8\%$ across the whole sweep, which makes it
+the most stable quantity in the project.
+
+The pooled MAD ratio is the exception, falling from $2.91$ to $1.63$ when the boundary moves
+to the modal onset. The quantity this report treats as the headline is stable under the
+boundary choice; the quantity it argues against reporting is the one that is not.
+
+\subsection{Effect on the persistence estimates}
+
+Write $z_t = \mu_d + u_t$ with $\mu_d$ constant within a day and $u_t$ an AR(1) with
+coefficient $\rho_w$. Almost every lag-one pair lies inside a day, so
+\[
+\rho_{\text{pooled}}
+= \frac{\sigma_{\text{day}}^{2} + \rho_w \sigma_{\text{within}}^{2}}
+       {\sigma_{\text{day}}^{2} + \sigma_{\text{within}}^{2}} .
+\]
+Inverting at the shares above:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ & pre & stress & post \\
+\midrule
+Pooled AR(1), as reported        & $0.851$ & $0.976$ & $0.792$ \\
+Implied within-day AR(1)         & $0.825$ & $0.723$ & $0.786$ \\
+Implied within-day half-life (s) & $3.6$ & $2.1$ & $2.9$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The stress regime has the lowest within-day persistence of the three. Its pooled AR(1) of
+$0.976$ is almost entirely the daily-mean component.
+
+This is a two-component calculation on published values rather than a re-estimation. It is
+corroborated by a route sharing none of its machinery: the VECM refitted day by day removes
+the daily level by construction and returns median half-lives of $43.6$, $38.4$ and $27.6$
+seconds, placing the stress regime between the other two.
+
+Three estimators that remove the daily level return a small effect. Three that retain it
+return a large one. The choice of estimand moves the reported figure by a factor of seven.
+
+\subsection{One day, not one regime}
+
+The daily fits in Figure~3 resolve what remains. Eight of the nine stress days fit at
+$14$ and $67$ seconds, inside the pre-stress range of $10$ to $144$. The ninth is 31 July,
+the session following the announcement at 30 July 23:30 in the data's clock, at $1{,}003$
+seconds: seven times slower than the next slowest day
+in the sample and fifteen times slower than the next slowest stress day. The pooled stress
+mean of $155$ seconds is above every stress day except that one.
+
+
+Across the conventions in \code{03\_sensitivity.csv} the ratio spans $1.5$ to $24.8$. The
+direction is stable across all of them; the magnitude is not determined by the data alone.
+The supportable statement is that one day was extraordinary.
+
+% =====================================================================
+\section{Limitations}
+\label{sec:limits}
+
+\subsection{Two days fail the data-quality gate}
+
+The daily-bias check of Section~\ref{sec:grid} rejects seven of $53$ days at a threshold of
+$0.10$ pips. Two of them by a factor of fifteen.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Day & AUD/USD & USD/JPY & AUD/JPY & Open-market seconds \\
+\midrule
+11 Jul & $+0.143$ & $+0.338$ & $-0.228$ & $86{,}400$ \\
+12 Jul & $+0.137$ & $+0.320$ & $-0.217$ & $61{,}200$ \\
+31 Jul & $-0.045$ & $-0.104$ & $+0.068$ & $86{,}400$ \\
+1 Aug  & $-0.977$ & $-2.247$ & $+1.464$ & $86{,}400$ \\
+2 Aug  & $-0.991$ & $-2.252$ & $+1.468$ & $61{,}200$ \\
+8 Aug  & $+0.176$ & $+0.393$ & $-0.258$ & $86{,}400$ \\
+9 Aug  & $+0.180$ & $+0.402$ & $-0.265$ & $61{,}200$ \\
+\bottomrule
+\end{tabular}
+\caption{Median signed gap between each leg and the value the other two imply, in that leg's
+own pips. Source: \code{00\_daily\_bias.csv}.}
+\end{table}
+
+The gate returns a non-zero exit code on this sample. It exists to catch a persistent
+sub-pip bias, which the tail statistic cannot see: the $99.9$th percentile of the absolute
+gap passes at $3.21$, $7.29$ and $4.83$ pips against a $25$-pip threshold.
+
+The triangle cannot attribute the discrepancy to a leg. The three columns are one
+discrepancy expressed three ways and any single leg reproduces it exactly. Attribution
+requires a reference outside the triangle, and none is available: Dukascopy carries the same
+level on those days, but HistData sources from Dukascopy, so agreement between them
+establishes that the level is present in a shared upstream feed rather than that it is real.
+Settling it requires a feed from a different liquidity pool. The offset is documented and
+carried, not fixed.
+
+1 and 2 August carry a standing basis offset near $-1.47$ pips across $147{,}600$
+open-market seconds, which is $22\%$ to $24\%$ of the stress regime depending on the
+admission rule. The implied contribution to the regime mean basis is $-0.33$ to $-0.35$
+pips. The measured stress mean basis is $-0.27$ pips, against $+0.016$ pre and $+0.005$
+post. The two days account for the entire mean level shift attributed to the stress regime.
+
+Estimates insensitive to this: the changepoint dates, because a level offset constant within
+a day leaves within-hour dispersion unchanged and neither estimated changepoint falls near
+1 or 2 August; and the error-correction coefficients, because the VECM centres on the day.
+
+Estimates sensitive to it: the regime-level standard deviation, the pooled AR(1) of the
+level, and the positive-edge counts of Section~\ref{sec:band}.
+
+\subsection{The onset is bimodal, and the regime boundary is a choice}
+\label{sec:onset}
+
+The onset posterior has two modes. One sits at 24 July 17:00, the other at the policy
+decision on 30 July, and the $95\%$ window between them spans a weekend closure. Across the
+$17$ same-feature specifications of \code{02\_sensitivity.csv} the split is $11$ at 24 July,
+$4$ at 30 July, $1$ at 29 July and $1$ at 1 July.
+
+The boundary this project uses is 30 July, which is not the date the estimator selects most
+often. There are two reasons and they are of different kinds.
+
+The first is methodological. The per-second labels written by
+\code{02\_changepoint\_detection.py} are the \emph{median} segmentation: a bucket is called
+elevated when more than half the posterior mass says it is. 30 July is what that rule
+returns. 24 July is the posterior mode, a taller single spike carrying less than half the
+total mass. Reporting the mode while labelling on the median would leave the headline
+describing a different window from the one every downstream script consumes.
+
+The second is historical, and was a researcher degree of freedom rather than a result. The
+project was originally scoped around the 31 July policy decision, so the boundary sitting
+$8.5$ hours before that announcement is the one it was built to find. That is a prior, and
+Section~\ref{sec:sweep} replaces it with a measurement: the decomposition is evaluated at
+every candidate boundary rather than at the chosen one.
+
+The cost of the alternative is measured rather than argued. Taking the 24 July onset moves
+$338{,}396$ seconds from pre into stress and the closure ratio falls from $4.06$ to $3.35$
+(\code{03\_sensitivity.csv}, row \emph{02's modal onset, 24 Jul 17:00}). The chosen boundary
+is therefore the one under which the estimated shift is larger, and a reader who prefers
+the modal onset should read $3.35$ and adjust Section~\ref{sec:reconcile} accordingly.
+
+One observation bears on which mode is the more credible without settling it. The
+24 July 17:00 bucket covers 17:30 to 17:59:59, and it contains two of the twenty widest
+episodes in the sample: $7.335$ pips at 17:44:08, the widest in the entire pre-stress
+segment, and $5.65$ pips at 17:58:14. Both fall in the half hour after the rollover filter
+reopens, which the boundary audit of the next subsection shows carries $21.5$ times the
+expected episode rate. Part of the 24 July mode may therefore be the filter boundary rather
+than the market. That is not resolved here.
+
+A change falling inside a closure can only be recorded at the reopen, so the tables report
+the bracket the data supports rather than a modal hour. The return is better behaved,
+clustering at 12 to 13 August in $14$ of the $17$ same-feature specifications.
+
+\subsection{Censoring at the filter boundary}
+
+Episode detection excludes 17:00 to 17:30, so the detector sees a session opening at
+17:30:00 and closing at 16:59:59. Nine of the twenty widest episodes start in hour 17, which
+holds $2.1\%$ of admissible seconds, at $21.5$ times the expected rate. Two begin exactly at
+17:30:00 and three end exactly at 16:59:59, against an expectation of $0.0002$ for each.
+These are censored observations rather than starts and ends, and the widest episode in the
+sample, $8.911$ pips on 4 August, is one of them. Moving the boundary to 18:00 leaves the
+selected segmentation unchanged.
+
+\subsection{Scope}
+
+One event, two months, one currency triangle. The results describe a single episode and are
+not distributional claims about FX stress in general. The quotes are retail aggregator
+quotes, which biases Section~\ref{sec:band} toward finding no executable dislocation; the
+haircut ladder quantifies that bias rather than removing it.
+
+\subsection{Summary}
+
+Supported by the evidence:
+
+\begin{itemize}[leftmargin=1.6em,itemsep=3pt]
+  \item Hourly dispersion is best described by a bounded excursion that returns rather than
+  a permanent shift.
+  \item Within-hour dispersion rose by $1.21$ times, and that figure is stable across all
+  $128$ candidate regime boundaries.
+  \item The transaction-cost band exceeded the median basis by $12.7$ times at its tightest.
+  \item The two dollar legs opened the observed dislocations and the cross leg closed them.
+  \item The basis is close to unforecastable from its own components.
+  \item 31 July had a closure half-life of $1{,}003$ seconds.
+\end{itemize}
+
+Not supported: a permanent regime change, a uniformly slower stress regime, a threefold
+widening of the intraday basis, or any executable dislocation.
+
+% =====================================================================
+\section*{Appendix: where each claim is written down}
+
+\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+\textbf{File} & \textbf{Claim it supports} \\
+\midrule
+\code{00\_daily\_bias.csv} & Seven days breach the bias gate; 1 and 2 August by fifteenfold \\
+\code{00\_reconciliation.csv} & Tail agreement of each leg with its implied value \\
+\code{01\_summary\_stats.csv} & Moments of the basis; excess kurtosis $277$ \\
+\code{01\_closures.csv} & Eight closures detected from the data \\
+\code{02\_model\_evidence.csv} & Posterior over the four segmentations \\
+\code{02\_null\_calibration.csv} & Behaviour of the estimator when no change exists \\
+\code{02\_sensitivity.csv} & Twenty specifications, all selecting two changepoints \\
+\code{03\_var\_fit.csv} & Residual scales, correlations, sd of the daily mean basis \\
+\code{03\_error\_correction.csv} & $\alpha$, $\lambda$, HAC intervals, both half-lives \\
+\code{03\_closure\_speed.csv} & Daily $\lambda$ and half-life, 53 sessions \\
+\code{03\_sensitivity.csv} & Closure ratio across conventions, $1.5$ to $24.8$ \\
+\code{04\_attribution.csv} & Opening and closing shares by identity \\
+\code{04\_weak\_exogeneity.csv} & Sign restriction on $\alpha$, all three regimes \\
+\code{04\_basis\_causality.csv} & Effect sizes against placebo thresholds \\
+\code{05\_execution.csv} & Band width, dispersion, band-to-gap ratio \\
+\code{05\_haircut.csv} & Share clearing as a function of the spread scale \\
+\code{05\_latency.csv}, \code{05\_edge\_velocity.csv} & Diagnostics on the simultaneity limit \\
+\code{06\_normalisation.csv} & Noise and persistence split of the level change \\
+\code{06\_closure\_reconciliation.csv} & Five estimands of closure speed \\
+\code{06\_boundary\_audit.csv} & Censoring at the rollover boundary \\
+\code{07\_boundary\_named.csv} & The decomposition under each summarisation of the onset \\
+\code{07\_boundary\_sweep.csv} & The decomposition at all $128$ candidate boundaries \\
+\midrule
+\code{02\_changepoint\_posterior.png} & Excursion, bimodal onset, fitted segment levels \\
+\code{03\_closure\_speed.png} & Pooled stress mean set by one day \\
+\code{05\_bands.png} & Band against basis on a log axis \\
+\code{07\_boundary\_sweep.png} & The decomposition against the regime boundary \\
+\bottomrule
+\end{tabularx}
+
+\end{document}
