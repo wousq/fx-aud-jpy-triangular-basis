@@ -486,7 +486,7 @@ def set_style():
     plt.rcParams.update({
         "font.size": 9,
         "axes.titlesize": 9.5,
-        "axes.titleweight": 500,
+        "axes.titleweight": "normal",
         "axes.titlelocation": "left",
         "axes.titlepad": 10,
         "axes.labelsize": 8.5,
