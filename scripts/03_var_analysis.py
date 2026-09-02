@@ -825,6 +825,12 @@ def episode_decay(d, labels, n_regimes, tail=EPISODE_TAIL_SECONDS):
         window = np.abs(b[k:stop])
         hit = np.flatnonzero(window <= 0.5 * peak)
         rows.append({
+            # Both timestamps, so the ruler can be recomputed on any subset
+            # of episodes from the table alone. The start is what a filter
+            # on time of day selects on; the peak second is where the count
+            # to half actually begins, and the two can differ by minutes.
+            "start": d.index[a],
+            "peak_at": d.index[k],
             "regime": int(labels[k]),
             "peak_abs": peak,
             "seconds_to_half": float(hit[0]) if hit.size else np.nan,
@@ -1490,6 +1496,19 @@ def main():
     # ------------------------------------------------- model-free check
     print("episodes")
     decay, decay_paths = episode_decay(d, labels, n_regimes)
+    if decay is not None and len(decay):
+        save_table(
+            decay, "03_episode_decay", index=False,
+            caption=("Every episode's decay measured with a ruler: the "
+                     "widest second, and the seconds from it until the "
+                     "basis had fallen to half that. The medians in "
+                     "Table~\\ref{tab:persistence} are taken over this "
+                     "table. Censored episodes had not halved within the "
+                     "search window and are kept rather than dropped, "
+                     "because dropping them would discard exactly the slow "
+                     "episodes the question is about."),
+            label="tab:episode_decay")
+        print(decay.to_string(index=False))
     measured = {}
     if decay is not None:
         for k, name in enumerate(names):
