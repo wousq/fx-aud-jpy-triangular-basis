@@ -1,7 +1,31 @@
-* text eol=lf
+# ---------------------------------------------------------------- line endings
+#
 
-# Binary — never diff, never touch line endings
+* text=auto eol=lf
+
+# ------------------------------------------------------------------- binary
+# Never diff, never touch line endings.
+
 *.parquet binary
 *.png     binary
 *.pdf     binary
 *.zip     binary
+
+
+# ------------------------------------------------------- language statistics
+
+*.tex           linguist-documentation
+report/**       linguist-documentation
+docs/**         linguist-documentation
+*.md            linguist-documentation
+
+
+output/**       linguist-generated
+*.csv           linguist-generated
+
+
+# ------------------------------------------------------------------ diffs
+# Hunk headers that name the enclosing function rather than a bare line number.
+
+*.py            diff=python
+*.tex           diff=tex
